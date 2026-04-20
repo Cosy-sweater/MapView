@@ -111,7 +111,11 @@ class TileWorker(QRunnable):
             print(f"Worker Error [{self.z}/{self.x}/{self.y}]: {e}")
 
     def _draw_rows(self, painter, rows):
-        layer_water, layer_buildings, layer_roads = [], [], []
+        # РАЗДЕЛЯЕМ ВОДУ НА ПОЛИГОНЫ И ЛИНИИ
+        layer_water_poly = []
+        layer_water_line = []
+        layer_buildings = []
+        layer_roads = []
         tx, ty = self.x * 256, self.y * 256
 
         for wkb_data, tags_json in rows:
@@ -119,8 +123,12 @@ class TileWorker(QRunnable):
                 tags = json.loads(tags_json)
                 geom = load_wkb(wkb_data)
 
+                # Фильтруем объекты по типу геометрии
                 if 'natural' in tags or 'waterway' in tags:
-                    layer_water.append(geom)
+                    if geom.geom_type in ['Polygon', 'MultiPolygon']:
+                        layer_water_poly.append(geom)
+                    else:
+                        layer_water_line.append(geom)
                 elif 'building' in tags and self.z >= 13:
                     layer_buildings.append(geom)
                 elif 'highway' in tags:
@@ -128,17 +136,30 @@ class TileWorker(QRunnable):
             except:
                 pass
 
-        if layer_water:
+        # 1. Отрисовка: Вода (Озера) - Заливка без обводки
+        if layer_water_poly:
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(STYLES['water']['default']['color']))
-            for geom in layer_water: self._draw_geom(geom, painter, tx, ty)
+            for geom in layer_water_poly:
+                self._draw_geom(geom, painter, tx, ty)
 
+        # 2. Отрисовка: Вода (Реки) - Линии без заливки
+        if layer_water_line:
+            painter.setPen(
+                QPen(QColor(STYLES['water']['default']['color']), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.setBrush(Qt.NoBrush)  # КРИТИЧЕСКИ ВАЖНО: Никакой заливки для рек!
+            for geom in layer_water_line:
+                self._draw_geom(geom, painter, tx, ty)
+
+        # 3. Отрисовка: Здания - Заливка с обводкой
         if layer_buildings:
             b_style = STYLES['building']['default']
             painter.setPen(QPen(QColor(b_style['outline']), 1))
             painter.setBrush(QColor(b_style['color']))
-            for geom in layer_buildings: self._draw_geom(geom, painter, tx, ty)
+            for geom in layer_buildings:
+                self._draw_geom(geom, painter, tx, ty)
 
+        # 4. Отрисовка: Дороги - Линии без заливки
         for geom, hw_type in layer_roads:
             style = STYLES['highway'].get(hw_type, STYLES['highway']['default'])
             pen = QPen(QColor(style['color']))
