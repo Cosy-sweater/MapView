@@ -1,0 +1,18 @@
+layers:
+  osm: # Имя слоя, которое мы задали в конвертере
+    highway:
+      color: "#F6A841"
+      width: 2.0
+      z_min: 6
+    waterway:
+      color: "#74A0C2"
+      width: 1.5
+      z_min: 8
+    building:
+      color: "#D0D0D0"
+      fill: "#E8E8E8"
+      width: 0.5
+      z_min: 13
+    natural:
+      fill: "#C2DCA8"
+      z_min: 8

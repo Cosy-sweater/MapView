@@ -1,396 +1,425 @@
 import sys
-import sqlite3
-import json
+import os
 import math
-from collections import OrderedDict
-from PyQt5.QtWidgets import QApplication, QWidget, QMainWindow
-from PyQt5.QtGui import QPainter, QPainterPath, QPen, QColor, QPixmap, QImage
-from PyQt5.QtCore import Qt, QObject, pyqtSignal, QRunnable, QThreadPool, pyqtSlot, QRectF
-from shapely.wkb import loads as load_wkb
+import time
+import zlib
+import sqlite3
+import yaml
+import queue
+import threading
 import mercantile
+import mapbox_vector_tile
+from cachetools import LRUCache
 
-# Импорт уровней из вашего конфига
-from constants import ZOOM_LEVELS
+from PyQt5.QtWidgets import QApplication, QMainWindow, QOpenGLWidget, QVBoxLayout, QWidget, QPushButton
+from PyQt5.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QFont, QPolygonF
+from PyQt5.QtCore import Qt, QPointF, QRectF, pyqtSignal, QObject
 
-# --- Настройки ---
-DB_ZOOMS = ZOOM_LEVELS
-
-STYLES = {
-    'highway': {
-        'motorway': {'color': '#e990a0', 'width': 4},
-        'trunk': {'color': '#f9b29c', 'width': 3},
-        'primary': {'color': '#fcd6a4', 'width': 3},
-        'secondary': {'color': '#f7fabf', 'width': 2},
-        'default': {'color': '#ffffff', 'width': 1.5}
-    },
-    'building': {
-        'default': {'color': '#d9d0c9', 'outline': '#c0b8b2'}
-    },
-    'water': {
-        'default': {'color': '#a5c0df'}
-    },
-    'background': '#f2efe9'
-}
+# ==========================================
+# 1. Настройки и Глобальные константы
+# ==========================================
+TILE_SIZE = 256
+MVT_EXTENT = 4096
+MVT_SCALE = TILE_SIZE / MVT_EXTENT  # Перевод MVT координат в 256px тайл
 
 
-# --- Вспомогательная математика ---
-def lonlat_to_pixel(lon, lat, zoom):
-    # Защита от Math Domain Error на полюсах
-    lat = max(min(lat, 85.0511), -85.0511)
-    n = 2.0 ** zoom
-    x = (lon + 180.0) / 360.0 * n * 256.0
-    lat_rad = math.radians(lat)
-    y = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n * 256.0
-    return x, y
+# ==========================================
+# 2. Менеджер Стилизации (Горячая замена)
+# ==========================================
+class StyleManager:
+    def __init__(self, config_path="style.yaml"):
+        self.config_path = config_path
+        self.rules = {}
+        self.load_styles()
+
+    def load_styles(self):
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                self.rules = yaml.safe_load(f).get('layers', {}).get('osm', {})
+            print("Стили успешно загружены.")
+        except Exception as e:
+            print(f"Ошибка загрузки стилей: {e}")
+            self.rules = {}
+
+    def get_style(self, tags, zoom):
+        for key in ['highway', 'waterway', 'building', 'natural']:
+            if key in tags:
+                rule = self.rules.get(key)
+                if rule and zoom >= rule.get('z_min', 0):
+                    return rule, key
+        return None, None
 
 
-def pixel_to_lonlat(px, py, zoom):
-    n = 2.0 ** zoom
-    lon = px / (n * 256.0) * 360.0 - 180.0
-    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * py / (n * 256.0))))
-    lat = math.degrees(lat_rad)
-    return lon, lat
-
-
-# --- Фоновая загрузка с поддержкой ОТМЕНЫ ---
+# ==========================================
+# 3. Асинхронный Загрузчик (Worker & Queue)
+# ==========================================
 class WorkerSignals(QObject):
-    finished = pyqtSignal(tuple, QImage)
+    # Сигнал для передачи готовых путей в UI-поток
+    tile_decoded = pyqtSignal(tuple, list)
 
 
-class TileWorker(QRunnable):
-    def __init__(self, z, x, y, db_path):
-        super().__init__()
-        self.z, self.x, self.y = z, x, y
+class TileLoader:
+    def __init__(self, db_path, cache_ref):
         self.db_path = db_path
+        self.cache = cache_ref
+        self.task_queue = queue.PriorityQueue()
         self.signals = WorkerSignals()
-        self.cancelled = False  # Флаг отмены задачи
+        self.active_workers = True
+        self.visible_tiles = set()  # Для инвалидации старых задач
 
-    @pyqtSlot()
-    def run(self):
-        # Если задача устарела еще до старта потока — отменяем
-        if self.cancelled:
+        # Thread Local Storage для SQLite (SQLite не любит шаринг между потоками)
+        self.local = threading.local()
+
+        for _ in range(4):  # 4 потока декодирования
+            t = threading.Thread(target=self._worker_loop, daemon=True)
+            t.start()
+
+    def get_db(self):
+        if not hasattr(self.local, 'conn'):
+            self.local.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.local.cursor = self.local.conn.cursor()
+        return self.local.cursor
+
+    def request_tile(self, z, x, y, center_tx, center_ty):
+        if (z, x, y) in self.cache:
             return
 
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+        # ТЗ: Приоритет по центру + LIFO для новых
+        dist_to_center = math.hypot(x - center_tx, y - center_ty)
+        lifo_priority = -time.time()
+        priority = (dist_to_center, lifo_priority)
 
-            query = """
-                SELECT g.geometry_wkb, tg.tags_json
-                FROM tiles t
-                JOIN geometries g ON t.geom_id = g.id
-                JOIN tags tg ON t.tag_id = tg.id
-                WHERE t.zoom = ? AND t.tile_x = ? AND t.tile_y = ?
-            """
-            cursor.execute(query, (self.z, self.x, self.y))
-            rows = cursor.fetchall()
+        self.task_queue.put((priority, (z, x, y)))
 
-            # Вторая проверка после SQL-запроса
-            if self.cancelled:
-                conn.close()
-                return
-
-            image = QImage(256, 256, QImage.Format_ARGB32)
-            image.fill(Qt.transparent)
-
-            if rows:
-                painter = QPainter(image)
-                painter.setRenderHint(QPainter.Antialiasing, True)
-                try:
-                    self._draw_rows(painter, rows)
-                finally:
-                    painter.end()
-
-            conn.close()
-
-            # Финальная проверка перед отправкой в UI
-            if not self.cancelled:
-                self.signals.finished.emit((self.z, self.x, self.y), image.copy())
-
-        except Exception as e:
-            print(f"Worker Error [{self.z}/{self.x}/{self.y}]: {e}")
-
-    def _draw_rows(self, painter, rows):
-        # РАЗДЕЛЯЕМ ВОДУ НА ПОЛИГОНЫ И ЛИНИИ
-        layer_water_poly = []
-        layer_water_line = []
-        layer_buildings = []
-        layer_roads = []
-        tx, ty = self.x * 256, self.y * 256
-
-        for wkb_data, tags_json in rows:
+    def _worker_loop(self):
+        while self.active_workers:
             try:
-                tags = json.loads(tags_json)
-                geom = load_wkb(wkb_data)
+                priority, tile_key = self.task_queue.get(timeout=1)
+                z, x, y = tile_key
 
-                # Фильтруем объекты по типу геометрии
-                if 'natural' in tags or 'waterway' in tags:
-                    if geom.geom_type in ['Polygon', 'MultiPolygon']:
-                        layer_water_poly.append(geom)
-                    else:
-                        layer_water_line.append(geom)
-                elif 'building' in tags and self.z >= 13:
-                    layer_buildings.append(geom)
-                elif 'highway' in tags:
-                    layer_roads.append((geom, tags.get('highway', 'default')))
-            except:
-                pass
+                # ТЗ: Garbage Collection (Инвалидация)
+                if tile_key not in self.visible_tiles:
+                    self.task_queue.task_done()
+                    continue
 
-        # 1. Отрисовка: Вода (Озера) - Заливка без обводки
-        if layer_water_poly:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(STYLES['water']['default']['color']))
-            for geom in layer_water_poly:
-                self._draw_geom(geom, painter, tx, ty)
+                cursor = self.get_db()
+                tms_y = (1 << z) - 1 - y  # Конвертация Web Mercator -> TMS (MBTiles)
+                cursor.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
+                               (z, x, tms_y))
+                row = cursor.fetchone()
 
-        # 2. Отрисовка: Вода (Реки) - Линии без заливки
-        if layer_water_line:
-            painter.setPen(
-                QPen(QColor(STYLES['water']['default']['color']), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            painter.setBrush(Qt.NoBrush)  # КРИТИЧЕСКИ ВАЖНО: Никакой заливки для рек!
-            for geom in layer_water_line:
-                self._draw_geom(geom, painter, tx, ty)
+                if row:
+                    raw_data = zlib.decompress(row[0])
+                    decoded = mapbox_vector_tile.decode(raw_data)
+                    paths = self._build_paths(decoded)
+                    self.signals.tile_decoded.emit(tile_key, paths)
+                else:
+                    # Пустой тайл (нет данных)
+                    self.signals.tile_decoded.emit(tile_key, [])
 
-        # 3. Отрисовка: Здания - Заливка с обводкой
-        if layer_buildings:
-            b_style = STYLES['building']['default']
-            painter.setPen(QPen(QColor(b_style['outline']), 1))
-            painter.setBrush(QColor(b_style['color']))
-            for geom in layer_buildings:
-                self._draw_geom(geom, painter, tx, ty)
+                self.task_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Ошибка декодирования тайла {tile_key}: {e}")
+                self.task_queue.task_done()
 
-        # 4. Отрисовка: Дороги - Линии без заливки
-        for geom, hw_type in layer_roads:
-            style = STYLES['highway'].get(hw_type, STYLES['highway']['default'])
-            pen = QPen(QColor(style['color']))
-            pen.setWidthF(style['width'])
-            pen.setCapStyle(Qt.RoundCap)
-            pen.setJoinStyle(Qt.RoundJoin)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            self._draw_geom(geom, painter, tx, ty)
+    def _build_paths(self, mvt_data):
+        """Парсинг MVT геометрии в массивы данных (БЕЗ QPainterPath, т.к. мы в фоне)"""
+        features_data = []
+        if 'osm' not in mvt_data: return features_data
 
-    def _draw_geom(self, geom, painter, tx, ty):
-        if geom.geom_type in ('LineString', 'LinearRing'):
-            self._draw_path(geom.coords, painter, tx, ty)
-        elif geom.geom_type == 'MultiLineString':
-            for line in geom.geoms: self._draw_path(line.coords, painter, tx, ty)
-        elif geom.geom_type == 'Polygon':
-            self._draw_poly(geom, painter, tx, ty)
-        elif geom.geom_type == 'MultiPolygon':
-            for poly in geom.geoms: self._draw_poly(poly, painter, tx, ty)
+        for feat in mvt_data['osm']['features']:
+            geom_type = feat['geometry']['type']
+            coords = feat['geometry']['coordinates']
+            tags = feat['properties']
 
-    def _draw_path(self, coords, painter, tx, ty):
-        path = QPainterPath()
-        first = True
-        for lon, lat in coords:
-            px, py = lonlat_to_pixel(lon, lat, self.z)
-            if first:
-                path.moveTo(px - tx, py - ty)
-                first = False
-            else:
-                path.lineTo(px - tx, py - ty)
-        painter.drawPath(path)
-
-    def _draw_poly(self, poly, painter, tx, ty):
-        path = QPainterPath()
-        self._add_ring(path, poly.exterior.coords, tx, ty)
-        for interior in poly.interiors:
-            self._add_ring(path, interior.coords, tx, ty)
-        painter.drawPath(path)
-
-    def _add_ring(self, path, coords, tx, ty):
-        first = True
-        for lon, lat in coords:
-            px, py = lonlat_to_pixel(lon, lat, self.z)
-            if first:
-                path.moveTo(px - tx, py - ty)
-                first = False
-            else:
-                path.lineTo(px - tx, py - ty)
-        path.closeSubpath()
+            features_data.append({
+                'type': geom_type,
+                'coords': coords,
+                'tags': tags
+            })
+        return features_data
 
 
-# --- Главный виджет карты ---
-class MapWidget(QWidget):
+# ==========================================
+# 4. Главный OpenGL Холст Карты
+# ==========================================
+class MapCanvas(QOpenGLWidget):
     def __init__(self, db_path):
         super().__init__()
-        self.db_path = db_path
-        self.zoom = 13.0
-        self.center_lon, self.center_lat = 33.38, 35.14
+        self.setMouseTracking(True)
+        self.setUpdateBehavior(QOpenGLWidget.PartialUpdate)
 
-        self.is_panning = False
+        self.style_manager = StyleManager()
+
+        # ТЗ: LRU Кэш для QPainterPath (память ограничиваем 1000 тайлами)
+        self.tile_cache = LRUCache(maxsize=1000)
+        self.loader = TileLoader(db_path, self.tile_cache)
+        self.loader.signals.tile_decoded.connect(self.on_tile_decoded)
+
+        # Навигация (Кипр по умолчанию)
+        self.center_lon = 33.3823
+        self.center_lat = 35.1856
+        self.zoom = 10.0
+
+        # Взаимодействие
+        self.dragging = False
         self.last_mouse_pos = None
 
-        self.pixmap_cache = OrderedDict()
-        self.MAX_CACHE_TILES = 150  # Лимит кэша в оперативной памяти
+    def on_tile_decoded(self, tile_key, features_data):
+        """Вызывается в Главном потоке. Конвертирует сырые данные в аппаратные QPainterPath"""
+        compiled_features = []
+        for feat in features_data:
+            path = QPainterPath()
+            if feat['type'] == 'LineString':
+                path.moveTo(feat['coords'][0][0] * MVT_SCALE, feat['coords'][0][1] * MVT_SCALE)
+                for pt in feat['coords'][1:]:
+                    path.lineTo(pt[0] * MVT_SCALE, pt[1] * MVT_SCALE)
+            elif feat['type'] == 'Polygon':
+                for ring in feat['coords']:
+                    path.moveTo(ring[0][0] * MVT_SCALE, ring[0][1] * MVT_SCALE)
+                    for pt in ring[1:]:
+                        path.lineTo(pt[0] * MVT_SCALE, pt[1] * MVT_SCALE)
+                    path.closeSubpath()
 
-        self.active_workers = OrderedDict()
-        self.MAX_QUEUE_SIZE = 64  # Лимит очереди для защиты CPU
+            compiled_features.append({
+                'path': path,
+                'tags': feat['tags'],
+                'type': feat['type']
+            })
 
-        self.thread_pool = QThreadPool()
-        self.thread_pool.setMaxThreadCount(6)
+        self.tile_cache[tile_key] = compiled_features
+        self.update()  # Запрос перерисовки экрана
 
-    def get_db_zoom(self, current_zoom):
-        available_zooms = [z for z in DB_ZOOMS if z <= current_zoom]
-        return max(available_zooms) if available_zooms else min(DB_ZOOMS)
-
-    @pyqtSlot(tuple, QImage)
-    def on_tile_loaded(self, key, image):
-        self.pixmap_cache[key] = QPixmap.fromImage(image)
-
-        if key in self.active_workers:
-            del self.active_workers[key]
-
-        while len(self.pixmap_cache) > self.MAX_CACHE_TILES:
-            self.pixmap_cache.popitem(last=False)
-
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(STYLES['background']))
-        # Включаем плавное сглаживание при масштабировании тайлов
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-
-        cx, cy = self.width() / 2, self.height() / 2
-        db_zoom = self.get_db_zoom(self.zoom)
-        scale_factor = 2.0 ** (self.zoom - db_zoom)
-
-        c_px_x, c_px_y = lonlat_to_pixel(self.center_lon, self.center_lat, self.zoom)
-
-        west, north = pixel_to_lonlat(c_px_x - cx, c_px_y - cy, self.zoom)
-        east, south = pixel_to_lonlat(c_px_x + cx, c_px_y + cy, self.zoom)
-
-        raw_tiles = list(mercantile.tiles(west, south, east, north, [db_zoom]))
-
-        # --- 1. АГРЕССИВНАЯ ОЧИСТКА ОЧЕРЕДИ ---
-        # Удаляем запросы старых зумов
-        for key, worker in list(self.active_workers.items()):
-            if key[0] != db_zoom:
-                worker.cancelled = True
-                del self.active_workers[key]
-
-        # Если очередь переполнена, удаляем самые старые запросы
-        while len(self.active_workers) >= self.MAX_QUEUE_SIZE:
-            key, worker = self.active_workers.popitem(last=False)
-            worker.cancelled = True
-
-        # --- 2. СОРТИРОВКА ТАЙЛОВ ПО УДАЛЕННОСТИ ОТ ЦЕНТРА ---
-        prioritized_tiles = []
-        for tile in raw_tiles:
-            tile_px_x = (tile.x * 256) * scale_factor
-            tile_px_y = (tile.y * 256) * scale_factor
-            screen_x = tile_px_x - c_px_x + cx
-            screen_y = tile_px_y - c_px_y + cy
-
-            tile_center_x = screen_x + (128 * scale_factor)
-            tile_center_y = screen_y + (128 * scale_factor)
-
-            dist = (tile_center_x - cx) ** 2 + (tile_center_y - cy) ** 2
-            prioritized_tiles.append((dist, tile, screen_x, screen_y))
-
-        prioritized_tiles.sort(key=lambda t: t[0])
-
-        # --- 3. ОТРИСОВКА И ЗАПРОСЫ ---
-        for dist, tile, screen_x, screen_y in prioritized_tiles:
-            key = (tile.z, tile.x, tile.y)
-            # QRectF предотвращает появление щелей в 1 пиксель между тайлами
-            dest_rect = QRectF(screen_x, screen_y, 256 * scale_factor, 256 * scale_factor)
-
-            if key in self.pixmap_cache:
-                # Отрисовка идеального тайла
-                pix = self.pixmap_cache[key]
-                painter.drawPixmap(dest_rect, pix, QRectF(0, 0, 256, 256))
-            else:
-                # Запуск фонового воркера
-                if key not in self.active_workers:
-                    worker = TileWorker(tile.z, tile.x, tile.y, self.db_path)
-                    self.active_workers[key] = worker
-                    worker.signals.finished.connect(self.on_tile_loaded)
-                    self.thread_pool.start(worker)
-
-                # --- ЛОГИКА OVER-ZOOMING (ОТКАТ К РОДИТЕЛЮ) ---
-                fallback_found = False
-                parent_z, parent_x, parent_y = tile.z, tile.x, tile.y
-                dz = 0
-
-                while parent_z > min(DB_ZOOMS):
-                    parent_z -= 1
-                    parent_x //= 2
-                    parent_y //= 2
-                    dz += 1
-
-                    if (parent_z, parent_x, parent_y) in self.pixmap_cache:
-                        parent_pix = self.pixmap_cache[(parent_z, parent_x, parent_y)]
-                        scale_diff = 2 ** dz
-                        src_w = 256 / scale_diff
-                        src_h = 256 / scale_diff
-                        src_x = (tile.x % scale_diff) * src_w
-                        src_y = (tile.y % scale_diff) * src_h
-
-                        # Растягиваем нужный фрагмент старого тайла на весь квадрат
-                        painter.drawPixmap(dest_rect, parent_pix, QRectF(src_x, src_y, src_w, src_h))
-                        fallback_found = True
-                        break
-
-                if not fallback_found:
-                    painter.setPen(QPen(Qt.gray, 1, Qt.DashLine))
-                    painter.drawRect(dest_rect.toRect())
-
-        # --- ИНФО-ПАНЕЛЬ ---
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 220))
-        painter.drawRect(10, 10, 280, 110)
-
-        painter.setPen(Qt.black)
-        painter.drawText(20, 30, f"Zoom: {self.zoom:.2f} (DB Layer: Z{db_zoom})")
-        painter.drawText(20, 50, f"Queue / Active: {len(self.active_workers)} / {self.MAX_QUEUE_SIZE}")
-        painter.drawText(20, 70, f"RAM Cache: {len(self.pixmap_cache)} / {self.MAX_CACHE_TILES} tiles")
-
-        cache_mb = len(self.pixmap_cache) * 0.25
-        if cache_mb > (self.MAX_CACHE_TILES * 0.25) * 0.85:
-            painter.setPen(Qt.red)
-        else:
-            painter.setPen(Qt.darkGreen)
-        painter.drawText(20, 90, f"Cache Size: ~{cache_mb:.1f} MB")
-
-        painter.setPen(Qt.blue)
-        painter.drawText(20, 110, f"Center: Lat {self.center_lat:.5f}, Lon {self.center_lon:.5f}")
-
-    # --- Обработка мыши ---
+    # --- МАТЕМАТИКА НАВИГАЦИИ ---
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.is_panning = True
+            self.dragging = True
             self.last_mouse_pos = event.pos()
-
-    def mouseMoveEvent(self, event):
-        if self.is_panning:
-            dx = event.x() - self.last_mouse_pos.x()
-            dy = event.y() - self.last_mouse_pos.y()
-            c_px, c_py = lonlat_to_pixel(self.center_lon, self.center_lat, self.zoom)
-            self.center_lon, self.center_lat = pixel_to_lonlat(c_px - dx, c_py - dy, self.zoom)
-            self.last_mouse_pos = event.pos()
-            self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.is_panning = False
+            self.dragging = False
+
+    def mouseMoveEvent(self, event):
+        if self.dragging:
+            delta = event.pos() - self.last_mouse_pos
+            # Перевод смещения пикселей экрана в градусы
+            pixels_per_lon = (TILE_SIZE * (2 ** self.zoom)) / 360.0
+            pixels_per_lat = (TILE_SIZE * (2 ** self.zoom)) / 180.0  # Упрощенно для панорамирования
+
+            self.center_lon -= delta.x() / pixels_per_lon
+            self.center_lat += delta.y() / pixels_per_lat
+            self.last_mouse_pos = event.pos()
+            self.update()
 
     def wheelEvent(self, event):
-        zoom_step = 0.5 if event.angleDelta().y() > 0 else -0.5
-        self.zoom = max(4.0, min(18.0, self.zoom + zoom_step))
+        zoom_delta = event.angleDelta().y() / 1200.0
+        self.zoom = max(6.0, min(14.0, self.zoom + zoom_delta))
         self.update()
 
+    # --- ОТРИСОВКА ---
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#F4F4F4"))  # Фон карты
 
-if __name__ == '__main__':
+        # 1. Расчет видимой сетки тайлов
+        w, h = self.width(), self.height()
+        cx, cy = mercantile.xy(self.center_lon, self.center_lat)
+
+        z_int = int(self.zoom)
+        scale_fraction = 2 ** (self.zoom - z_int)
+
+        # Вычисляем дробный тайл в центре экрана
+        center_tx = (self.center_lon + 180.0) / 360.0 * (2 ** z_int)
+        lat_rad = math.radians(self.center_lat)
+        center_ty = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * (2 ** z_int)
+
+        # Определяем границы экрана в тайлах
+        tiles_w = (w / TILE_SIZE) / scale_fraction
+        tiles_h = (h / TILE_SIZE) / scale_fraction
+
+        min_tx = int(math.floor(center_tx - tiles_w / 2))
+        max_tx = int(math.ceil(center_tx + tiles_w / 2))
+        min_ty = int(math.floor(center_ty - tiles_h / 2))
+        max_ty = int(math.ceil(center_ty + tiles_h / 2))
+
+        # Обновляем видимые тайлы для Garbage Collector'а
+        visible_keys = set((z_int, x, y) for x in range(min_tx, max_tx + 1) for y in range(min_ty, max_ty + 1))
+        self.loader.visible_tiles = visible_keys
+
+        # 2. Рендеринг тайлов
+        painter.save()
+        # Смещаем центр координат painter'а в центр экрана
+        painter.translate(w / 2, h / 2)
+        painter.scale(scale_fraction, scale_fraction)
+
+        for x in range(min_tx, max_tx + 1):
+            for y in range(min_ty, max_ty + 1):
+                tile_key = (z_int, x, y)
+
+                # Пиксельные координаты левого верхнего угла тайла относительно центра
+                px = (x - center_tx) * TILE_SIZE
+                py = (y - center_ty) * TILE_SIZE
+
+                painter.save()
+                painter.translate(px, py)
+
+                if tile_key in self.tile_cache:
+                    self.draw_vector_features(painter, self.tile_cache[tile_key], z_int)
+                else:
+                    self.loader.request_tile(z_int, x, y, center_tx, center_ty)
+                    # ТЗ: Overzooming (ищем тайл меньшего зума в кэше)
+                    self.draw_overzoom(painter, z_int, x, y)
+
+                # Отрисовка границ тайла (для дебага)
+                painter.setPen(QPen(QColor(200, 200, 200, 100), 1))
+                painter.drawRect(0, 0, TILE_SIZE, TILE_SIZE)
+                painter.restore()
+
+        painter.restore()
+
+        # 3. Дебаг Overlay и Масштабная линейка
+        self.draw_overlays(painter, w, h)
+        painter.end()
+
+    def draw_vector_features(self, painter, features, zoom):
+        """Отрисовка массива QPainterPath с применением текущих стилей"""
+        for feat in features:
+            rule, layer_name = self.style_manager.get_style(feat['tags'], zoom)
+            if not rule: continue
+
+            path = feat['path']
+            pen = QPen(Qt.NoPen)
+            brush = QBrush(Qt.NoBrush)
+
+            if 'color' in rule:
+                pen = QPen(QColor(rule['color']), rule.get('width', 1.0))
+                pen.setJoinStyle(Qt.RoundJoin)
+                pen.setCapStyle(Qt.RoundCap)
+            if 'fill' in rule and feat['type'] == 'Polygon':
+                brush = QBrush(QColor(rule['fill']))
+
+            painter.setPen(pen)
+            painter.setBrush(brush)
+            painter.drawPath(path)
+
+    def draw_overzoom(self, painter, z, x, y):
+        """ТЗ: Если тайла нет, берем родительский тайл, растягиваем и смещаем"""
+        for z_diff in range(1, 4):
+            parent_z = z - z_diff
+            parent_x = x >> z_diff
+            parent_y = y >> z_diff
+
+            if (parent_z, parent_x, parent_y) in self.tile_cache:
+                # Нашли! Рассчитываем смещение внутри родителя
+                scale = 2 ** z_diff
+                offset_x = (x - (parent_x << z_diff)) * TILE_SIZE
+                offset_y = (y - (parent_y << z_diff)) * TILE_SIZE
+
+                painter.save()
+                # Клиппируем, чтобы куски родителя не вылезали за границы текущего тайла
+                painter.setClipRect(0, 0, TILE_SIZE, TILE_SIZE)
+
+                # Масштабируем и сдвигаем родительский тайл
+                painter.translate(-offset_x, -offset_y)
+                painter.scale(scale, scale)
+
+                self.draw_vector_features(painter, self.tile_cache[(parent_z, parent_x, parent_y)], parent_z)
+                painter.restore()
+                return  # Нарисовали самый свежий родитель, выходим
+
+    def draw_overlays(self, painter, w, h):
+        # Отладочная информация в левом верхнем углу
+        painter.setPen(Qt.black)
+        painter.setFont(QFont("Consolas", 10))
+
+        info = [
+            f"Coords: {self.center_lon:.4f}, {self.center_lat:.4f}",
+            f"Viewport Zoom: {self.zoom:.2f}",
+            f"DB Level (z_int): {int(self.zoom)}",
+            f"Cache Memory: {len(self.tile_cache)} / 1000 tiles",
+            f"Queue Size: {self.loader.task_queue.qsize()}"
+        ]
+
+        y_offset = 20
+        for text in info:
+            # Тень для читаемости
+            painter.setPen(Qt.white)
+            painter.drawText(11, y_offset + 1, text)
+            painter.setPen(Qt.black)
+            painter.drawText(10, y_offset, text)
+            y_offset += 15
+
+        # Масштабная линейка в левом нижнем углу
+        # Метров в одном пикселе на экваторе = 156543.03 / 2^zoom
+        meters_per_pixel = 156543.03392 * math.cos(math.radians(self.center_lat)) / (2 ** self.zoom)
+
+        # Выбираем красивый шаг (например 5 км, 1 км, 500 м)
+        target_width_px = 150
+        target_meters = meters_per_pixel * target_width_px
+
+        if target_meters > 5000:
+            bar_dist = 5000; label = "5 km"
+        elif target_meters > 1000:
+            bar_dist = 1000; label = "1 km"
+        elif target_meters > 500:
+            bar_dist = 500; label = "500 m"
+        else:
+            bar_dist = 100; label = "100 m"
+
+        bar_px = bar_dist / meters_per_pixel
+
+        bottom_y = h - 20
+        painter.setPen(QPen(Qt.black, 3))
+        painter.drawLine(10, bottom_y, int(10 + bar_px), bottom_y)
+        painter.drawLine(10, bottom_y - 5, 10, bottom_y + 5)
+        painter.drawLine(int(10 + bar_px), bottom_y - 5, int(10 + bar_px), bottom_y + 5)
+
+        painter.drawText(10, bottom_y - 10, label)
+
+
+# ==========================================
+# 5. Главное окно приложения
+# ==========================================
+class MainWindow(QMainWindow):
+    def __init__(self, db_path):
+        super().__init__()
+        self.setWindowTitle("OSM Vector Tile Viewer")
+        self.resize(1024, 768)
+
+        central_widget = QWidget()
+        layout = QVBoxLayout(central_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.map_canvas = MapCanvas(db_path)
+
+        # Кнопка горячей перезагрузки стилей
+        btn_reload = QPushButton("🔄 Перезагрузить стили (style.yaml)")
+        btn_reload.clicked.connect(self.reload_styles)
+        btn_reload.setStyleSheet("background-color: #333; color: white; padding: 5px;")
+
+        layout.addWidget(btn_reload)
+        layout.addWidget(self.map_canvas)
+
+        self.setCentralWidget(central_widget)
+
+    def reload_styles(self):
+        self.map_canvas.style_manager.load_styles()
+        self.map_canvas.update()
+
+
+if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = QMainWindow()
-    window.setWindowTitle("Vector Tile Viewer (Pro Edition)")
-    window.resize(1024, 768)
 
-    # Укажите путь к вашей SQLite базе данных
-    map_widget = MapWidget("vector_tiles.sqlite")
-    window.setCentralWidget(map_widget)
+    # Имя файла базы, который мы сгенерировали скриптом конвертера
+    db_file = "cyprus_fast.mbtiles"
+
+    if not os.path.exists(db_file):
+        print(f"ВНИМАНИЕ: Файл {db_file} не найден. Карта будет пустой.")
+
+    window = MainWindow(db_file)
     window.show()
     sys.exit(app.exec_())

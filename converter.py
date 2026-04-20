@@ -1,277 +1,275 @@
-import osmium
-import osmium.geom
-import mercantile
+import os
+import yaml
+import zlib
 import sqlite3
-import json
-import hashlib
+import mercantile
+import mapbox_vector_tile
 import multiprocessing as mp
+from collections import defaultdict
 from shapely.wkb import loads as load_wkb
-from shapely.wkb import dumps as dump_wkb
-from shapely.geometry import box
+from shapely.geometry import shape, mapping, box
 from shapely.validation import make_valid
+from shapely.ops import transform
+import osmium
 from tqdm import tqdm
 
-from constants import allowed_tags
-
-# --- ПРАВИЛЬНЫЙ НАБОР ЗУМОВ ---
-# Мы останавливаемся на 14! Большие зумы клиент растянет сам без потери качества.
+# ==========================================
+# Настройки оптимизации
+# ==========================================
+MVT_EXTENT = 4096
 OPTIMIZED_ZOOMS = [6, 8, 10, 12, 14]
 
 
+def load_allowed_tags():
+    try:
+        with open("render_tags.yaml", 'r') as f:
+            return set(yaml.safe_load(f).get('tags', []))
+    except FileNotFoundError:
+        # Базовый набор на случай отсутствия конфига
+        return {'highway', 'building', 'waterway', 'natural', 'landuse', 'amenity'}
+
+
+ALLOWED_TAGS = load_allowed_tags()
+
+
 # ==========================================
-# 1. WORKER: Продвинутая обработка геометрии
+# 1. Фильтрация и Эвристика (Тот самый буст скорости)
 # ==========================================
-def geometry_worker(worker_id, task_queue, result_queue, progress_queue):
-    def is_important(zoom, tags):
-        if 'highway' in tags:
-            hw = tags['highway']
-            if zoom <= 6: return hw in ['motorway', 'trunk']
-            if zoom <= 8: return hw in ['motorway', 'trunk', 'primary']
-            if zoom <= 10: return hw in ['motorway', 'trunk', 'primary', 'secondary']
-            if zoom <= 12: return hw not in ['footway', 'path', 'steps', 'pedestrian', 'track', 'service']
-            return True
+def is_important(zoom, tags):
+    if 'highway' in tags:
+        hw = tags['highway']
+        if zoom <= 6: return hw in ['motorway', 'trunk']
+        if zoom <= 8: return hw in ['motorway', 'trunk', 'primary']
+        if zoom <= 10: return hw in ['motorway', 'trunk', 'primary', 'secondary']
+        if zoom <= 12: return hw not in ['footway', 'path', 'steps', 'pedestrian', 'track', 'service']
+        return True
+    if 'building' in tags: return zoom >= 13
+    if any(k in tags for k in ['natural', 'landuse', 'waterway']): return zoom >= 8
+    return zoom >= 12
 
-        if 'building' in tags: return zoom >= 13
-        if any(k in tags for k in ['natural', 'landuse', 'waterway']): return zoom >= 8
-        return zoom >= 14
 
-    def sanitize_geometry(geom):
-        """Очистка коллекций и лечение битой топологии"""
-        if geom.is_empty:
-            return []
+def project_to_mvt_pixels(geom, tile):
+    bounds = mercantile.xy_bounds(tile)
+    # ИСПРАВЛЕНИЕ: xy_bounds возвращает left, bottom, right, top
+    w, s, e, n = bounds.left, bounds.bottom, bounds.right, bounds.top
 
-        # Лечим геометрию (исправляет самопересечения и баги OSM)
-        if not geom.is_valid:
-            geom = make_valid(geom)
+    def transform_coords(lon, lat):
+        try:
+            # Для старых версий Shapely (передаются числа float)
+            mx, my = mercantile.xy(lon, lat)
+            x = int((mx - w) / (e - w) * MVT_EXTENT)
+            y = int((n - my) / (n - s) * MVT_EXTENT)
+            return x, y
+        except TypeError:
+            # Для Shapely 2.0+ (передаются массивы NumPy)
+            import numpy as np
+            mx = lon * 20037508.34 / 180.0
+            my = np.log(np.tan((90.0 + lat) * np.pi / 360.0)) * 20037508.34 / 180.0
+            x = ((mx - w) / (e - w) * MVT_EXTENT).astype(int)
+            y = ((n - my) / (n - s) * MVT_EXTENT).astype(int)
+            return x, y
 
-        if geom.geom_type in ['LineString', 'MultiLineString', 'Polygon', 'MultiPolygon']:
-            return [geom]
-        elif geom.geom_type == 'GeometryCollection':
-            return [g for g in geom.geoms if
-                    g.geom_type in ['LineString', 'MultiLineString', 'Polygon', 'MultiPolygon']]
-        return []
+    return transform(transform_coords, geom)
 
-    while True:
-        batch = task_queue.get()
-        if batch is None: break
+# ==========================================
+# Stage 1 Worker: Геометрия -> Тайлы
+# ==========================================
+def process_geometry_batch(batch):
+    """Воркер: Принимает батч WKB, режет на тайлы, возвращает локальные координаты"""
+    results = defaultdict(list)
 
-        processed_batch = []
-        for wkb_hex, tags_dict in batch:
-            try:
-                shapely_geom = load_wkb(wkb_hex, hex=True)
+    # Bbox для обрезки внутри MVT тайла (с небольшим буфером от швов)
+    mvt_bbox = box(-100, -100, MVT_EXTENT + 100, MVT_EXTENT + 100)
 
-                # Лечим сырую геометрию ДО любых трансформаций
-                if not shapely_geom.is_valid:
-                    shapely_geom = make_valid(shapely_geom)
+    for wkb_hex, tags_dict in batch:
+        try:
+            geom = load_wkb(wkb_hex, hex=True)
+            if not geom.is_valid:
+                geom = make_valid(geom)
 
-                bounds = shapely_geom.bounds
-                width = bounds[2] - bounds[0]
-                height = bounds[3] - bounds[1]
+            bounds = geom.bounds
+            width = bounds[2] - bounds[0]
+            height = bounds[3] - bounds[1]
 
-                for zoom in OPTIMIZED_ZOOMS:
-                    if not is_important(zoom, tags_dict): continue
+            for zoom in OPTIMIZED_ZOOMS:
+                if not is_important(zoom, tags_dict): continue
 
-                    pixel_size_deg = 360.0 / (256.0 * (2 ** zoom))
 
-                    if shapely_geom.geom_type in ['Polygon', 'MultiPolygon']:
-                        if width < pixel_size_deg and height < pixel_size_deg: continue
-                    elif shapely_geom.geom_type in ['LineString', 'MultiLineString']:
-                        if shapely_geom.length < (pixel_size_deg * 2): continue
 
+                pixel_size_deg = 360.0 / (256.0 * (2 ** zoom))
+
+                # Отбрасываем невидимый мусор
+                if geom.geom_type in ['Polygon', 'MultiPolygon']:
+                    if width < pixel_size_deg and height < pixel_size_deg: continue
+                elif geom.geom_type in ['LineString', 'MultiLineString']:
+                    if geom.length < (pixel_size_deg * 2): continue
+
+                if 'building' in tags_dict:
+                    tolerance = pixel_size_deg * 0.1
+                else:
                     tolerance = pixel_size_deg * 1.5
-                    simplified_geom = shapely_geom.simplify(tolerance, preserve_topology=True)
 
-                    if simplified_geom.is_empty: continue
+                simplified_geom = geom.simplify(tolerance, preserve_topology=True)
+                if simplified_geom.is_empty: continue
 
-                    intersecting_tiles = mercantile.tiles(bounds[0], bounds[1], bounds[2], bounds[3], [zoom])
+                # Находим пересекаемые тайлы
+                intersecting_tiles = mercantile.tiles(bounds[0], bounds[1], bounds[2], bounds[3], [zoom])
 
-                    for tile in intersecting_tiles:
-                        tile_bounds = mercantile.bounds(tile)
-                        tile_box = box(tile_bounds.west, tile_bounds.south, tile_bounds.east, tile_bounds.north)
+                for tile in intersecting_tiles:
+                    # 1. Переводим координаты в локальные пиксели тайла (0..4096)
+                    local_geom = project_to_mvt_pixels(simplified_geom, tile)
 
-                        clipped_geom = simplified_geom.intersection(tile_box)
+                    # 2. Обрезаем геометрию по границе тайла
+                    clipped_geom = local_geom.intersection(mvt_bbox)
+                    if clipped_geom.is_empty: continue
 
-                        # Очищаем и лечим обрезанные куски
-                        valid_geoms = sanitize_geometry(clipped_geom)
-                        for valid_geom in valid_geoms:
-                            clipped_wkb_bytes = dump_wkb(valid_geom)
-                            processed_batch.append((zoom, tile.x, tile.y, clipped_wkb_bytes, tags_dict))
+                    # 3. Фильтруем коллекции, возникшие при обрезке
+                    geoms_to_add = []
+                    if clipped_geom.geom_type == 'GeometryCollection':
+                        geoms_to_add = [g for g in clipped_geom.geoms if
+                                        g.geom_type in ['LineString', 'MultiLineString', 'Polygon', 'MultiPolygon']]
+                    elif clipped_geom.geom_type in ['LineString', 'MultiLineString', 'Polygon', 'MultiPolygon']:
+                        geoms_to_add = [clipped_geom]
 
-            except BaseException:
-                pass
+                    for g in geoms_to_add:
+                        results[(zoom, tile.x, tile.y)].append({
+                            'geometry': mapping(g),
+                            'properties': tags_dict
+                        })
+        except Exception as e:
+            # Выводим ошибку в консоль, чтобы больше не ловить "0 тайлов" вслепую
+            print(f"Ошибка в геометрии: {e}")
+            pass
 
-        if processed_batch:
-            result_queue.put(processed_batch)
-        progress_queue.put(1)
-
-
-# ==========================================
-# 2. CONSUMER: Запись в БД (Дедупликация)
-# ==========================================
-def db_writer(db_path, result_queue):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    # ЭКСТРЕМАЛЬНАЯ ОПТИМИЗАЦИЯ ЗАПИСИ
-    cursor.execute("PRAGMA synchronous = OFF;")
-    cursor.execute("PRAGMA journal_mode = MEMORY;")
-
-    cursor.executescript("""
-        CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE, tags_json TEXT);
-        CREATE TABLE IF NOT EXISTS geometries (id INTEGER PRIMARY KEY AUTOINCREMENT, hash TEXT UNIQUE, geometry_wkb BLOB);
-        CREATE TABLE IF NOT EXISTS tiles (zoom INTEGER, tile_x INTEGER, tile_y INTEGER, geom_id INTEGER, tag_id INTEGER);
-    """)
-    conn.commit()
-
-    tag_cache = {}
-    geom_cache = {}
-
-    def get_tag_id(tags_dict):
-        tags_json = json.dumps(tags_dict, sort_keys=True)
-        tag_hash = hashlib.md5(tags_json.encode('utf-8')).hexdigest()
-        if tag_hash in tag_cache: return tag_cache[tag_hash]
-
-        cursor.execute("INSERT OR IGNORE INTO tags (hash, tags_json) VALUES (?, ?)", (tag_hash, tags_json))
-        cursor.execute("SELECT id FROM tags WHERE hash = ?", (tag_hash,))
-        tag_id = cursor.fetchone()[0]
-        tag_cache[tag_hash] = tag_id
-        return tag_id
-
-    def get_geom_id(wkb_bytes):
-        geom_hash = hashlib.md5(wkb_bytes).hexdigest()
-        if geom_hash in geom_cache: return geom_cache[geom_hash]
-
-        cursor.execute("INSERT OR IGNORE INTO geometries (hash, geometry_wkb) VALUES (?, ?)", (geom_hash, wkb_bytes))
-        cursor.execute("SELECT id FROM geometries WHERE hash = ?", (geom_hash,))
-        geom_id = cursor.fetchone()[0]
-        geom_cache[geom_hash] = geom_id
-        return geom_id
-
-    write_count = 0
-    while True:
-        batch = result_queue.get()
-        if batch is None:
-            break
-
-        for zoom, tile_x, tile_y, clipped_wkb_bytes, tags_dict in batch:
-            tag_id = get_tag_id(tags_dict)
-            geom_id = get_geom_id(clipped_wkb_bytes)
-            cursor.execute(
-                "INSERT INTO tiles (zoom, tile_x, tile_y, geom_id, tag_id) VALUES (?, ?, ?, ?, ?)",
-                (zoom, tile_x, tile_y, geom_id, tag_id)
-            )
-
-        write_count += 1
-        if write_count % 500 == 0:  # Редкие коммиты для скорости
-            conn.commit()
-
-    conn.commit()
-    print("\nСоздание индексов (около 10 секунд)...")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tiles_zxy ON tiles(zoom, tile_x, tile_y);")
-    cursor.execute("VACUUM;")
-    cursor.execute("ANALYZE;")
-    conn.commit()
-    conn.close()
+    return results
 
 
 # ==========================================
-# 3. PRODUCER: Чтение файла OSM
+# Stage 2 Worker: Сборка MVT Protobuf
 # ==========================================
-class ParallelTilePipeline(osmium.SimpleHandler):
-    def __init__(self, task_queue, pbar):
+def process_mvt_worker(args):
+    """Воркер: Принимает список фичей для одного тайла -> возвращает байты MVT"""
+    tile_key, features = args
+    z, x, y = tile_key
+
+    layer = {"name": "osm", "features": features}
+    try:
+        # mapbox_vector_tile.encode - самая тяжелая операция, теперь она в пуле процессов
+        mvt_data = mapbox_vector_tile.encode([layer], default_options={"extents": MVT_EXTENT})
+        return z, x, y, mvt_data
+    except Exception:
+        return None
+
+
+# ==========================================
+# OSM Parser (Продюсер)
+# ==========================================
+class FastOsmHandler(osmium.SimpleHandler):
+    def __init__(self):
         super().__init__()
         self.wkbfab = osmium.geom.WKBFactory()
-        self.task_queue = task_queue
-        self.pbar = pbar
         self.batch = []
-        self.BATCH_SIZE = 1000  # Увеличен батч для снижения нагрузки на потоки
-        self.batches_sent = 0
+        self.BATCH_SIZE = 2000
+        self.pool = mp.Pool(max(1, mp.cpu_count() - 1))
+        self.async_results = []
 
-    def flush_batch(self):
+    def _flush(self):
         if self.batch:
-            self.task_queue.put(self.batch)
-            self.pbar.update(len(self.batch))
+            # Асинхронно отправляем батч в Stage 1
+            res = self.pool.apply_async(process_geometry_batch, (self.batch,))
+            self.async_results.append(res)
             self.batch = []
-            self.batches_sent += 1
 
     def way(self, w):
-        # ИСПРАВЛЕНИЕ БАГА ТОПОЛОГИИ: Исключили 'natural', 'landuse' и 'building'
-        # Линии - это только дороги и реки.
-        if 'highway' not in w.tags and 'waterway' not in w.tags:
-            return
-
+        if 'highway' not in w.tags and 'waterway' not in w.tags: return
+        tags = {k.k: k.v for k in w.tags if k.k in ALLOWED_TAGS}
+        if not tags: return
         try:
             wkb = self.wkbfab.create_linestring(w)
-            tags = {k.k: k.v for k in w.tags if k.k in allowed_tags}
-            if tags:
-                self.batch.append((wkb, tags))
-                if len(self.batch) >= self.BATCH_SIZE: self.flush_batch()
+            self.batch.append((wkb, tags))
+            if len(self.batch) >= self.BATCH_SIZE: self._flush()
         except Exception:
             pass
 
     def area(self, a):
-        # Полигоны - это здания, водоемы, парки.
-        if 'building' not in a.tags and 'natural' not in a.tags and 'landuse' not in a.tags:
-            return
-
+        if 'building' not in a.tags and 'natural' not in a.tags and 'landuse' not in a.tags: return
+        tags = {k.k: k.v for k in a.tags if k.k in ALLOWED_TAGS}
+        if not tags: return
         try:
             wkb = self.wkbfab.create_multipolygon(a)
-            tags = {k.k: k.v for k in a.tags if k.k in allowed_tags}
-            if tags:
-                self.batch.append((wkb, tags))
-                if len(self.batch) >= self.BATCH_SIZE: self.flush_batch()
+            self.batch.append((wkb, tags))
+            if len(self.batch) >= self.BATCH_SIZE: self._flush()
         except Exception:
             pass
 
+    def finish_and_aggregate(self):
+        self._flush()
+        aggregated_tiles = defaultdict(list)
+
+        print("\n[Stage 1] Расчет геометрии и обрезка по тайлам...")
+        for res in tqdm(self.async_results, total=len(self.async_results), desc="Обработка батчей"):
+            batch_result = res.get()  # Получаем словари от воркеров
+            # Объединяем результаты в один большой словарь (Group By Tile)
+            for tile_key, features in batch_result.items():
+                aggregated_tiles[tile_key].extend(features)
+
+        return aggregated_tiles
+
+
+# ==========================================
+# Запись в MBTiles
+# ==========================================
+def write_to_mbtiles(db_path, mvt_generator, total_tiles):
+    if os.path.exists(db_path): os.remove(db_path)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    cursor.execute("PRAGMA synchronous = OFF;")
+    cursor.execute("PRAGMA journal_mode = WAL;")
+    cursor.execute("CREATE TABLE metadata (name text, value text);")
+    cursor.execute("CREATE TABLE tiles (zoom_level integer, tile_column integer, tile_row integer, tile_data blob);")
+    cursor.execute("CREATE UNIQUE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row);")
+
+    batch = []
+    print(f"\n[Stage 2] Сериализация {total_tiles} тайлов в MVT и запись в БД...")
+    for result in tqdm(mvt_generator, total=total_tiles, desc="Генерация MVT"):
+        if result:
+            z, x, y, mvt_data = result
+            compressed = zlib.compress(mvt_data)
+            tms_y = (1 << z) - 1 - y  # TMS инверсия для MBTiles
+            batch.append((z, x, tms_y, compressed))
+
+            if len(batch) >= 500:
+                cursor.executemany("INSERT INTO tiles VALUES (?, ?, ?, ?)", batch)
+                batch = []
+                conn.commit()
+
+    if batch:
+        cursor.executemany("INSERT INTO tiles VALUES (?, ?, ?, ?)", batch)
+
+    conn.commit()
+    conn.isolation_level = None
+    cursor.execute("VACUUM;")
+    conn.close()
+
 
 if __name__ == '__main__':
-    pbf_file = "mapfiles/cyprus.osm.pbf"
-    db_file = "vector_tiles.sqlite"
+    PBF_FILE = "mapfiles/cyprus.osm.pbf"
+    DB_FILE = "cyprus_fast.mbtiles"
 
-    num_workers = max(1, mp.cpu_count() - 2)
-    print(f"Запуск: {num_workers} воркеров. Используемые зумы: {OPTIMIZED_ZOOMS}")
+    # 1. Читаем и режем геометрию
+    handler = FastOsmHandler()
+    print("Чтение OSM PBF (извлечение нужных путей/полигонов)...")
+    handler.apply_file(PBF_FILE, locations=True, idx='flex_mem')
 
-    task_queue = mp.Queue(maxsize=1000)
-    result_queue = mp.Queue(maxsize=1000)
-    progress_queue = mp.Queue()
+    # Агрегация словаря
+    tiles_dict = handler.finish_and_aggregate()
+    total_tiles = len(tiles_dict)
 
-    db_process = mp.Process(target=db_writer, args=(db_file, result_queue))
-    db_process.start()
+    # 2. Параллельное кодирование MVT
+    with mp.Pool(max(1, mp.cpu_count() - 1)) as pool:
+        # imap_unordered мгновенно отдает готовые тайлы
+        mvt_generator = pool.imap_unordered(process_mvt_worker, tiles_dict.items())
+        write_to_mbtiles(DB_FILE, mvt_generator, total_tiles)
 
-    workers = []
-    for i in range(num_workers):
-        p = mp.Process(target=geometry_worker, args=(i, task_queue, result_queue, progress_queue))
-        p.start()
-        workers.append(p)
-
-    # --- ЭТАП 1: Чтение OSM ---
-    print("\n--- ЭТАП 1: Извлечение геометрии из OSM ---")
-    with tqdm(desc="Чтение файла", unit=" obj") as pbar:
-        handler = ParallelTilePipeline(task_queue, pbar)
-        handler.apply_file(pbf_file, locations=True, idx='flex_mem')
-        handler.flush_batch()
-
-    total_batches = handler.batches_sent
-
-    # Сигнал остановки воркерам
-    for _ in range(num_workers):
-        task_queue.put(None)
-
-    # --- ЭТАП 2: Математика ---
-    print("\n--- ЭТАП 2: Обработка геометрии и нарезка ---")
-    with tqdm(total=total_batches, desc="Упрощение и Тайлинг", unit=" batch") as pbar_geom:
-        batches_processed = 0
-        while batches_processed < total_batches:
-            progress_queue.get()  # Ждем сигнал готовности батча от воркера
-            batches_processed += 1
-            pbar_geom.update(1)
-
-    for p in workers:
-        p.join()
-
-    # --- ЭТАП 3: Финализация БД ---
-    print("\n--- ЭТАП 3: Запись и сжатие БД ---")
-    result_queue.put(None)
-    db_process.join()
-
-    print("\nПайплайн успешно завершен!")
+    print(f"\nГотово! MBTiles успешно создан: {DB_FILE}")
