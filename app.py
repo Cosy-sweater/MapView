@@ -9,7 +9,6 @@ import queue
 import threading
 import mercantile
 import mapbox_vector_tile
-from cachetools import LRUCache
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QOpenGLWidget, QVBoxLayout,
                              QWidget, QPushButton, QHBoxLayout, QFileDialog,
@@ -28,13 +27,15 @@ MVT_SCALE = TILE_SIZE / MVT_EXTENT
 MIN_DB_ZOOM = 6
 MAX_DB_ZOOM = 14
 
-# Создаем папку для баз данных по умолчанию
+MAX_CACHE_TILES = 600
+TARGET_CACHE_TILES = 500
+
 MAPFILES_DIR = os.path.join(os.getcwd(), ".mapfiles")
 os.makedirs(MAPFILES_DIR, exist_ok=True)
 DOWNLOADS_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 
 LAYER_PRIORITY = {
-    'landmass': 5,  # Суша всегда в самом низу
+    'landmass': 5,
     'greenery': 10,
     'water_poly': 20,
     'waterway': 30,
@@ -46,7 +47,8 @@ LAYER_PRIORITY = {
     'highway_primary': 45,
     'highway_trunk': 46,
     'highway_motorway': 47,
-    'building': 50
+    'building_large': 50,
+    'building_small': 51
 }
 
 DEFAULT_STYLES = {
@@ -55,7 +57,8 @@ DEFAULT_STYLES = {
         'greenery': {'fill': '#C2DCA8', 'z_min': 6},
         'water_poly': {'fill': '#74A0C2', 'z_min': 6},
         'waterway': {'color': '#74A0C2', 'width': 1.5, 'z_min': 7},
-        'building': {'fill': '#D9D8D6', 'color': '#C4C3C1', 'width': 0.5, 'z_min': 14},
+        'building_large': {'fill': '#D9D8D6', 'color': '#B4B3B1', 'width': 0.5, 'z_min': 13},
+        'building_small': {'fill': '#D9D8D6', 'color': '#C4C3C1', 'width': 0.5, 'z_min': 14},
         'highway_service': {'color': '#FFFFFF', 'width': 1.0, 'z_min': 14},
         'highway_residential': {'color': '#FFFFFF', 'width': 1.5, 'z_min': 12},
         'highway_unclassified': {'color': '#FFFFFF', 'width': 1.5, 'z_min': 11},
@@ -93,7 +96,6 @@ class ConverterThread(QThread):
     def run(self):
         try:
             import converter
-            # ИСПРАВЛЕНИЕ: Вызываем вашу функцию run(map_path, output_path)
             converter.run(self.pbf_path, self.mbtiles_path)
             self.finished.emit(self.mbtiles_path)
         except Exception as e:
@@ -140,8 +142,6 @@ class StyleEditorDialog(QDialog):
     def __init__(self, style_manager, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Редактор стилей (style.yaml)")
-
-        # ИСПРАВЛЕНИЕ: Убираем знак вопроса из заголовка окна
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.resize(500, 600)
         self.style_manager = style_manager
@@ -217,13 +217,8 @@ class StyleEditorDialog(QDialog):
         btn.color_val = hex_color
 
         def pick_color():
-            # ИСПРАВЛЕНИЕ: Используем простой встроенный диалог вместо системного
-            color = QColorDialog.getColor(
-                QColor(btn.color_val),
-                self,
-                "Выберите цвет",
-                QColorDialog.DontUseNativeDialog
-            )
+            color = QColorDialog.getColor(QColor(btn.color_val), self, "Выберите цвет",
+                                          QColorDialog.DontUseNativeDialog)
             if color.isValid():
                 btn.color_val = color.name()
                 btn.setStyleSheet(f"background-color: {btn.color_val}; border: 1px solid black;")
@@ -235,12 +230,12 @@ class StyleEditorDialog(QDialog):
         new_rules = {}
         for layer_name, old_props in self.style_manager.rules.items():
             new_rules[layer_name] = old_props.copy()
-            if 'fill' in self.inputs[layer_name]:
-                new_rules[layer_name]['fill'] = self.inputs[layer_name]['fill'].color_val
-            if 'color' in self.inputs[layer_name]:
-                new_rules[layer_name]['color'] = self.inputs[layer_name]['color'].color_val
-            if 'width' in self.inputs[layer_name]:
-                new_rules[layer_name]['width'] = self.inputs[layer_name]['width'].value()
+            if 'fill' in self.inputs[layer_name]: new_rules[layer_name]['fill'] = self.inputs[layer_name][
+                'fill'].color_val
+            if 'color' in self.inputs[layer_name]: new_rules[layer_name]['color'] = self.inputs[layer_name][
+                'color'].color_val
+            if 'width' in self.inputs[layer_name]: new_rules[layer_name]['width'] = self.inputs[layer_name][
+                'width'].value()
 
         self.style_manager.save_styles(new_rules)
         self.accept()
@@ -270,7 +265,6 @@ class ConverterWindow(QWidget):
         layout = QVBoxLayout(self)
 
         settings_layout = QFormLayout()
-
         self.btn_select_pbf = QPushButton("Выбрать файл .pbf")
         self.btn_select_pbf.clicked.connect(self.select_pbf)
         self.lbl_pbf = QLabel("Файл не выбран")
@@ -280,7 +274,6 @@ class ConverterWindow(QWidget):
 
         settings_layout.addRow(self.btn_select_pbf, self.lbl_pbf)
         settings_layout.addRow("Имя карты:", self.input_name)
-
         layout.addLayout(settings_layout)
 
         self.btn_start = QPushButton("▶ НАЧАТЬ КОНВЕРТАЦИЮ")
@@ -290,6 +283,7 @@ class ConverterWindow(QWidget):
 
         self.log_console = QTextEdit()
         self.log_console.setReadOnly(True)
+        self.log_console.setTextInteractionFlags(Qt.NoTextInteraction)  # ЗАЩИТА ОТ КЛИКОВ (Логи не сбиваются)
         self.log_console.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: Consolas;")
         layout.addWidget(self.log_console)
 
@@ -399,6 +393,11 @@ class TileLoader:
             except:
                 pass
 
+        # Надежное закрытие потоков и SQLite базы
+        for t in self.threads:
+            if t.is_alive():
+                t.join(timeout=1.0)
+
     def get_db(self):
         if not hasattr(self.local, 'conn'):
             self.local.conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -477,7 +476,9 @@ class MapCanvas(QOpenGLWidget):
         self.setMouseTracking(True)
         self.setUpdateBehavior(QOpenGLWidget.PartialUpdate)
         self.style_manager = StyleManager()
-        self.tile_cache = LRUCache(maxsize=1500)
+
+        # Замена LRUCache на стандартный dict (Свой механизм сборки мусора)
+        self.tile_cache = {}
         self.loader = None
         self.db_path = None
 
@@ -487,12 +488,45 @@ class MapCanvas(QOpenGLWidget):
         self.dragging = False
         self.last_mouse_pos = None
 
+    def _auto_center(self, db_path):
+        """Математически вычисляет центр региона по данным из БД"""
+        try:
+            conn = sqlite3.connect(db_path)
+            c = conn.cursor()
+
+            c.execute("SELECT MIN(zoom_level) FROM tiles")
+            z_row = c.fetchone()
+            if not z_row or z_row[0] is None: return
+            z = z_row[0]
+
+            c.execute(
+                "SELECT MIN(tile_column), MAX(tile_column), MIN(tile_row), MAX(tile_row) FROM tiles WHERE zoom_level=?",
+                (z,))
+            row = c.fetchone()
+            conn.close()
+
+            if row and row[0] is not None:
+                min_x, max_x, min_y, max_y = row
+                center_x = (min_x + max_x) / 2.0
+                center_y_tms = (min_y + max_y) / 2.0
+                center_y = (1 << z) - 1 - center_y_tms
+
+                n = 2.0 ** z
+                self.center_lon = center_x / n * 360.0 - 180.0
+                lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * center_y / n)))
+                self.center_lat = math.degrees(lat_rad)
+                self.zoom = float(z)
+                print(f"Карта отцентрирована: Lat {self.center_lat:.4f}, Lon {self.center_lon:.4f}")
+        except Exception as e:
+            print(f"Ошибка авто-центрирования: {e}")
+
     def load_database(self, db_path):
         if self.loader: self.loader.stop()
         self.tile_cache.clear()
 
         if os.path.exists(db_path):
             self.db_path = db_path
+            self._auto_center(db_path)
             self.loader = TileLoader(db_path, self.tile_cache)
             self.loader.signals.tile_decoded.connect(self.on_tile_decoded)
             self.update()
@@ -505,8 +539,44 @@ class MapCanvas(QOpenGLWidget):
         self.tile_cache.clear()
         self.update()
 
+    def clean_cache(self):
+        """Умная очистка кэша (Spatial Eviction Policy)"""
+        if len(self.tile_cache) <= MAX_CACHE_TILES:
+            return
+
+        current_z = int(math.floor(self.zoom))
+
+        # Оценка бесполезности тайла
+        def get_score(key):
+            z, x, y = key
+            z_diff = abs(z - current_z)
+
+            # Перевод тайла в координаты для расчета дистанции до центра
+            n = 2.0 ** z
+            tile_lon = (x + 0.5) / n * 360.0 - 180.0
+            lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * (y + 0.5) / n)))
+            tile_lat = math.degrees(lat_rad)
+
+            dist_sq = (tile_lon - self.center_lon) ** 2 + (tile_lat - self.center_lat) ** 2
+            return (z_diff, dist_sq)
+
+        # Сортируем тайлы: сначала удаляем другие зумы, затем дальние по дистанции
+        sorted_keys = sorted(self.tile_cache.keys(), key=get_score, reverse=True)
+
+        tiles_to_delete = len(self.tile_cache) - TARGET_CACHE_TILES
+        deleted = 0
+
+        for k in sorted_keys:
+            if deleted >= tiles_to_delete: break
+            if self.loader and k in self.loader.visible_tiles: continue
+
+            del self.tile_cache[k]
+            deleted += 1
+
     def on_tile_decoded(self, tile_key, compiled_features):
         self.tile_cache[tile_key] = compiled_features
+        # Запускаем сборку мусора при добавлении нового тайла
+        self.clean_cache()
         self.update()
 
     def mousePressEvent(self, event):
@@ -533,7 +603,7 @@ class MapCanvas(QOpenGLWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#AADAFF"))  # Океан по умолчанию
+        painter.fillRect(self.rect(), QColor("#AADAFF"))
 
         if not self.loader:
             painter.setPen(Qt.black)
@@ -574,11 +644,17 @@ class MapCanvas(QOpenGLWidget):
 
         painter.restore()
 
-        # Информационный Overlay
+        # Информационный Overlay с Координатами
         painter.setPen(Qt.black)
         painter.setFont(QFont("Consolas", 10))
         y_offset = 20
-        for text in [f"Zoom: {self.zoom:.2f}", f"Cache: {len(self.tile_cache)}"]:
+        info = [
+            f"Center: {self.center_lat:.4f}, {self.center_lon:.4f}",
+            f"Zoom: {self.zoom:.2f}",
+            f"Cache: {len(self.tile_cache)} / {MAX_CACHE_TILES}"
+        ]
+
+        for text in info:
             painter.setPen(Qt.white);
             painter.drawText(11, y_offset + 1, text)
             painter.setPen(Qt.black);
@@ -591,7 +667,7 @@ class MapCanvas(QOpenGLWidget):
 
         for feat in sorted_features:
             l_name = feat.get('layer_name', '')
-            if feat['type'] == 'Polygon' and l_name == 'building':
+            if feat['type'] == 'Polygon' and l_name.startswith('building'):
                 rect = feat['path'].boundingRect()
                 if (rect.width() * scale_fraction < 2.5) and (rect.height() * scale_fraction < 2.5): continue
 
@@ -622,16 +698,16 @@ class MainWindow(QMainWindow):
 
         toolbar = QHBoxLayout()
 
-        btn_open = QPushButton("📂 Открыть Карту")
+        btn_open = QPushButton("Открыть Карту")
         btn_open.clicked.connect(self.open_map)
 
-        btn_convert = QPushButton("⚙️ Конвертер (PBF -> MBTiles)")
+        btn_convert = QPushButton("⚙Конвертер (PBF -> MBTiles)")
         btn_convert.clicked.connect(self.open_converter_dialog)
 
-        btn_style = QPushButton("🎨 Редактор Стилей")
+        btn_style = QPushButton("Редактор Стилей")
         btn_style.clicked.connect(self.open_style_editor)
 
-        btn_delete = QPushButton("🗑️ Удалить Карту")
+        btn_delete = QPushButton("Удалить Карту")
         btn_delete.setStyleSheet("background-color: #A00; color: white;")
         btn_delete.clicked.connect(self.delete_map)
 

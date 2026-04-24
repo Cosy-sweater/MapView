@@ -1,5 +1,10 @@
 layers:
-  building:
+  building_large:
+    color: '#B4B3B1'
+    fill: '#D9D8D6'
+    width: 0.5
+    z_min: 13
+  building_small:
     color: '#C4C3C1'
     fill: '#D9D8D6'
     width: 0.5
@@ -8,7 +13,7 @@ layers:
     fill: '#C2DCA8'
     z_min: 6
   highway_motorway:
-    color: '#bb61e8'
+    color: '#E892A2'
     width: 4.0
     z_min: 6
   highway_primary:
@@ -39,6 +44,9 @@ layers:
     color: '#FFFFFF'
     width: 1.5
     z_min: 11
+  landmass:
+    fill: '#F2EFE9'
+    z_min: 6
   water_poly:
     fill: '#74A0C2'
     z_min: 6

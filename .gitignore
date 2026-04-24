@@ -1,5 +1,7 @@
 # created by virtualenv automatically
 .venv
+.idea
+mapfiles
 *.sqlite
 *.pbf
 *.mbtiles

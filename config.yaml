@@ -1,11 +1,10 @@
-zooms: [6, 7, 8, 9, 10, 11, 12, 13, 14]
+zooms: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 
-# Пиксельные допуски (теперь более агрессивные для средних зумов)
 tolerances:
   lines:
-    6: 8.0   # Очень сильное сглаживание
-    10: 3.0  # Уберет мелкие извилины рек/дорог
-    14: 0.1  # Почти без потерь
+    6: 8.0
+    10: 3.0
+    14: 0.1
   polygons:
     6: 4.0
     10: 1.5
@@ -13,9 +12,9 @@ tolerances:
 
 layers:
   natural: { min_zoom: 6 }
-  water: { min_zoom: 6 }      # Для озер (natural=water)
-  waterway: { min_zoom: 7 }   # Для рек (waterway=*)
-  building: { min_zoom: 14 }
+  water: { min_zoom: 6 }
+  waterway: { min_zoom: 7 }
+  building: { min_zoom: 15 }
 
 highways:
   motorway: { min_zoom: 6, priority: 1 }
