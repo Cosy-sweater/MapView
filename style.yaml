@@ -1,50 +1,48 @@
 layers:
-  greenery:
-    fill: "#C2DCA8"
-    z_min: 6
-  water_poly:
-    fill: "#74A0C2"
-    z_min: 6
-  waterway:
-    color: "#74A0C2"
-    width: 1.5
-    z_min: 7
   building:
-    fill: "#D9D8D6"
-    color: "#C4C3C1"
+    color: '#C4C3C1'
+    fill: '#D9D8D6'
     width: 0.5
     z_min: 14
-
-  # --- ДОРОГИ ---
-  highway_service:
-    color: "#FFFFFF"
-    width: 1.0
-    z_min: 14
-  highway_residential:
-    color: "#FFFFFF"
-    width: 1.5
-    z_min: 12
-  highway_unclassified:
-    color: "#FFFFFF"
-    width: 1.5
-    z_min: 11
-  highway_tertiary:
-    color: "#FFFFB3"
-    width: 2.0
-    z_min: 10
-  highway_secondary:
-    color: "#F6CFA6"
-    width: 2.5
-    z_min: 9
-  highway_primary:
-    color: "#FCD6A4"
-    width: 3.0
-    z_min: 7
-  highway_trunk:
-    color: "#F9B29C"
-    width: 3.5
+  greenery:
+    fill: '#C2DCA8'
     z_min: 6
   highway_motorway:
-    color: "#E892A2"
+    color: '#bb61e8'
     width: 4.0
     z_min: 6
+  highway_primary:
+    color: '#FCD6A4'
+    width: 3.0
+    z_min: 7
+  highway_residential:
+    color: '#FFFFFF'
+    width: 1.5
+    z_min: 12
+  highway_secondary:
+    color: '#F6CFA6'
+    width: 2.5
+    z_min: 9
+  highway_service:
+    color: '#FFFFFF'
+    width: 1.0
+    z_min: 14
+  highway_tertiary:
+    color: '#FFFFB3'
+    width: 2.0
+    z_min: 10
+  highway_trunk:
+    color: '#F9B29C'
+    width: 3.5
+    z_min: 6
+  highway_unclassified:
+    color: '#FFFFFF'
+    width: 1.5
+    z_min: 11
+  water_poly:
+    fill: '#74A0C2'
+    z_min: 6
+  waterway:
+    color: '#74A0C2'
+    width: 1.5
+    z_min: 7

@@ -274,16 +274,17 @@ def write_to_mbtiles(db_path, mvt_generator, total_tiles):
     conn.close()
 
 
-# ==========================================
-# ТОЧКА ВХОДА
-# ==========================================
-if __name__ == '__main__':
+def run(map_path, output_path):
     handler = FastOsmHandler()
     print("Инициализация библиотеки Osmium (чтение .pbf)...")
-    handler.apply_file("mapfiles/cyprus.osm.pbf", locations=True, idx='flex_mem')
+    handler.apply_file(map_path, locations=True, idx='flex_mem')
 
     tiles_dict = handler.finish_and_aggregate()
 
     with mp.Pool(max(1, mp.cpu_count() - 1)) as pool:
         mvt_generator = pool.imap_unordered(process_mvt_worker, tiles_dict.items())
-        write_to_mbtiles("cyprus_fast.mbtiles", mvt_generator, len(tiles_dict))
+        write_to_mbtiles(output_path, mvt_generator, len(tiles_dict))
+
+
+if __name__ == "__main__":
+    run("mapfiles/cyprus.osm.pbf", "cyprus_fast.mbtiles")
