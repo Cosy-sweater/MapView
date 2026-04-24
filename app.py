@@ -26,6 +26,21 @@ MVT_SCALE = TILE_SIZE / MVT_EXTENT
 MIN_DB_ZOOM = 6
 MAX_DB_ZOOM = 14
 
+LAYER_PRIORITY = {
+    'greenery': 10,
+    'water_poly': 20,
+    'waterway': 30,
+    'highway_service': 40,
+    'highway_residential': 41,
+    'highway_unclassified': 42,
+    'highway_tertiary': 43,
+    'highway_secondary': 44,
+    'highway_primary': 45,
+    'highway_trunk': 46,
+    'highway_motorway': 47,
+    'building': 50
+}
+
 
 class StyleManager:
     def __init__(self, config_path="style.yaml"):
@@ -36,17 +51,16 @@ class StyleManager:
     def load_styles(self):
         try:
             with open(self.config_path, 'r', encoding='utf-8') as f:
-                self.rules = yaml.safe_load(f).get('layers', {}).get('osm', {})
+                self.rules = yaml.safe_load(f).get('layers', {})
         except Exception:
             self.rules = {}
 
-    def get_style(self, tags, zoom):
-        for key in ['highway', 'waterway', 'building', 'natural']:
-            if key in tags:
-                rule = self.rules.get(key)
-                if rule and zoom >= rule.get('z_min', 0):
-                    return rule, key
-        return None, None
+    def get_style(self, layer_name, zoom):
+        """Теперь мы просто ищем правило по имени MVT-слоя"""
+        rule = self.rules.get(layer_name)
+        if rule and zoom >= rule.get('z_min', 0):
+            return rule
+        return None
 
 
 class WorkerSignals(QObject):
@@ -267,40 +281,35 @@ class MapCanvas(QOpenGLWidget):
         painter.end()
 
     def draw_vector_features(self, painter, features, zoom, scale_fraction):
-        ordered_layers = ['natural', 'waterway', 'building', 'highway']
-        features_by_layer = {name: [] for name in ordered_layers}
+        # 1. Сортируем все объекты по Z-Index (снизу вверх)
+        sorted_features = sorted(features, key=lambda f: LAYER_PRIORITY.get(f.get('layer_name', ''), 0))
 
-        for feat in features:
-            l_name = feat.get('layer_name')
-            if l_name in features_by_layer:
-                features_by_layer[l_name].append(feat)
+        for feat in sorted_features:
+            layer_name = feat.get('layer_name', '')
 
-        for layer_name in ordered_layers:
-            for feat in features_by_layer[layer_name]:
-                # ОПТИМИЗАЦИЯ ДЛЯ ГОРОДОВ (Culling)
-                # Если объект — полигон (здание), проверяем его размер на экране
-                if feat['type'] == 'Polygon' and layer_name == 'building':
-                    rect = feat['path'].boundingRect()
-                    # Если домик меньше 2.5 пикселей на экране - не тратим ресурсы GPU на него
-                    if (rect.width() * scale_fraction < 2.5) and (rect.height() * scale_fraction < 2.5):
-                        continue
+            # Оптимизация (Culling) для мелких зданий
+            if feat['type'] == 'Polygon' and layer_name == 'building':
+                rect = feat['path'].boundingRect()
+                if (rect.width() * scale_fraction < 2.5) and (rect.height() * scale_fraction < 2.5):
+                    continue
 
-                rule, _ = self.style_manager.get_style(feat['tags'], zoom)
-                if not rule: continue
+            # 2. Получаем стиль, передавая ТОЛЬКО имя слоя (например, 'highway_primary')
+            rule = self.style_manager.get_style(layer_name, zoom)
+            if not rule: continue
 
-                pen = QPen(Qt.NoPen)
-                brush = QBrush(Qt.NoBrush)
+            pen = QPen(Qt.NoPen)
+            brush = QBrush(Qt.NoBrush)
 
-                if 'color' in rule:
-                    pen = QPen(QColor(rule['color']), rule.get('width', 1.0))
-                    pen.setJoinStyle(Qt.RoundJoin)
-                    pen.setCapStyle(Qt.RoundCap)
-                if 'fill' in rule and feat['type'] == 'Polygon':
-                    brush = QBrush(QColor(rule['fill']))
+            if 'color' in rule:
+                pen = QPen(QColor(rule['color']), rule.get('width', 1.0))
+                pen.setJoinStyle(Qt.RoundJoin)
+                pen.setCapStyle(Qt.RoundCap)
+            if 'fill' in rule and feat['type'] == 'Polygon':
+                brush = QBrush(QColor(rule['fill']))
 
-                painter.setPen(pen)
-                painter.setBrush(brush)
-                painter.drawPath(feat['path'])
+            painter.setPen(pen)
+            painter.setBrush(brush)
+            painter.drawPath(feat['path'])
 
     def draw_overlays(self, painter, w, h, z_int):
         painter.setPen(Qt.black)

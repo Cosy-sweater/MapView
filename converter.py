@@ -17,39 +17,58 @@ from tqdm import tqdm
 MVT_EXTENT = 4096
 
 # ==========================================
-# Загрузка конфигурации
+# 1. КОНФИГУРАЦИЯ И КОНСТАНТЫ
 # ==========================================
 with open("config.yaml", 'r', encoding='utf-8') as f:
     CONFIG = yaml.safe_load(f)
 
 ZOOMS = CONFIG.get('zooms', [6, 8, 10, 12, 14])
+MAX_DB_ZOOM = max(ZOOMS) if ZOOMS else 14
+
 TOLERANCES_LINES = CONFIG.get('tolerances', {}).get('lines', {})
 TOLERANCES_POLYS = CONFIG.get('tolerances', {}).get('polygons', {})
+
 HW_RULES = CONFIG.get('highways', {})
 WATER_RULES = CONFIG.get('waterways', {})
 LAYER_RULES = CONFIG.get('layers', {})
 
 
+# ==========================================
+# 2. ПРАВИЛА СЛОЕВ И ТЕГОВ
+# ==========================================
 def get_layer_and_zoom(tags):
+    """Определяет слой и минимальный зум на основе тегов OSM."""
+    # 1. Дороги (динамические слои: highway_motorway, highway_primary и т.д.)
     if 'highway' in tags:
-        return 'highway', HW_RULES.get(tags['highway'], 14)
+        hw_type = tags['highway']
+        rule = HW_RULES.get(hw_type)
+        if rule:
+            min_z = rule.get('min_zoom', 14) if isinstance(rule, dict) else rule
+            return f"highway_{hw_type}", min_z
 
+    # 2. Вода (Разделяем линии рек и полигоны озер)
     if 'waterway' in tags:
-        return 'waterway', WATER_RULES.get(tags['waterway'], 12)
+        min_z = WATER_RULES.get(tags['waterway'], 12)
+        return "waterway", min_z
+    if tags.get('natural') == 'water' or tags.get('landuse') == 'reservoir':
+        min_z = LAYER_RULES.get('water', {}).get('min_zoom', 6)
+        return "water_poly", min_z
 
-    if tags.get('natural') == 'water':
-        return 'waterway', LAYER_RULES.get('natural', {}).get('min_zoom', 6)
-
+    # 3. Здания
     if 'building' in tags:
-        return 'building', LAYER_RULES.get('building', {}).get('min_zoom', 13)
+        min_z = LAYER_RULES.get('building', {}).get('min_zoom', 14)
+        return "building", min_z
 
-    if 'natural' in tags or 'landuse' in tags:
-        return 'natural', LAYER_RULES.get('natural', {}).get('min_zoom', 6)
+    # 4. Природа (леса, парки)
+    if tags.get('natural') in ['wood', 'forest'] or tags.get('landuse') in ['forest', 'grass', 'meadow']:
+        min_z = LAYER_RULES.get('natural', {}).get('min_zoom', 6)
+        return "greenery", min_z
 
     return None, 99
 
 
 def project_to_mvt_pixels(geom, tile):
+    """Переводит координаты из градусов в локальную пиксельную сетку тайла 0..4096."""
     bounds = mercantile.xy_bounds(tile)
     w, s, e, n = bounds.left, bounds.bottom, bounds.right, bounds.top
 
@@ -67,12 +86,13 @@ def project_to_mvt_pixels(geom, tile):
 
 
 # ==========================================
-# Worker 1: Геометрия -> Тайлы (ОБНОВЛЕНО)
+# 3. МАТЕМАТИКА ГЕОМЕТРИИ (WORKER 1)
 # ==========================================
 def process_geometry_batch(batch):
+    """Параллельный воркер: фильтрует, сжимает и нарезает геометрию на тайлы."""
     results = defaultdict(lambda: defaultdict(list))
-    # Буфер обрезки 128 MVT единиц (предотвращает артефакты на самых краях)
-    mvt_bbox = box(-128, -128, MVT_EXTENT + 128, MVT_EXTENT + 128)
+    # Увеличенный буфер обрезки (256 единиц), предотвращает артефакты на границах тайлов
+    mvt_bbox = box(-256, -256, MVT_EXTENT + 256, MVT_EXTENT + 256)
 
     for wkb_hex, tags_dict in batch:
         try:
@@ -80,47 +100,52 @@ def process_geometry_batch(batch):
             if not layer_name: continue
 
             geom = load_wkb(wkb_hex, hex=True)
-            if not geom.is_valid: geom = make_valid(geom)
+            if not geom.is_valid:
+                geom = make_valid(geom)
             if geom.is_empty: continue
 
             bounds = geom.bounds
             is_poly = geom.geom_type in ['Polygon', 'MultiPolygon']
 
-            for zoom in ZOOMS:
-                if zoom < min_zoom: continue
+            # Защита от Overzooming: пакуем объекты в максимальный доступный слой БД
+            effective_min_zoom = min(min_zoom, MAX_DB_ZOOM)
 
-                # Градусов в одном пикселе на экваторе для текущего зума
+            for zoom in ZOOMS:
+                if zoom < effective_min_zoom: continue
+
                 pixel_size_deg = 360.0 / (256.0 * (2 ** zoom))
 
-                base_tol = TOLERANCES_POLYS.get(zoom, 1.0) if is_poly else TOLERANCES_LINES.get(zoom, 1.0)
-
-                # ИСПРАВЛЕНИЕ 1: Сжимаем ДО нарезки на тайлы (гарантирует отсутствие разрывов)
+                # --- СЖАТИЕ ГЕОМЕТРИИ ---
                 if layer_name == 'building':
-                    # Здания вообще не трогаем, чтобы не искажать форму
+                    # Здания сохраняем максимально точными
                     simplified_geom = geom
+                    # Фильтр "сараев" на низких зумах
+                    if zoom <= 13 and (bounds[2] - bounds[0]) < pixel_size_deg and (
+                            bounds[3] - bounds[1]) < pixel_size_deg:
+                        continue
                 else:
-                    # Дороги и леса сжимаем в градусной сетке
-                    tolerance = pixel_size_deg * base_tol * 0.5
-                    simplified_geom = geom.simplify(tolerance, preserve_topology=True)
+                    base_tol = TOLERANCES_POLYS.get(zoom, 1.0) if is_poly else TOLERANCES_LINES.get(zoom, 1.0)
+                    tolerance = pixel_size_deg * base_tol
+
+                    # Отключаем preserve_topology на мелких зумах, чтобы агрессивно резать сложные петли рек
+                    preserve = True if zoom >= 12 else False
+                    simplified_geom = geom.simplify(tolerance, preserve_topology=preserve)
 
                 if simplified_geom.is_empty: continue
+
+                # --- ЛЕЧЕНИЕ ЗЕЛЕНИ ---
                 if not simplified_geom.is_valid:
                     simplified_geom = make_valid(simplified_geom)
-
-                # ИСПРАВЛЕНИЕ 2: Фильтр "сараев" на уровне базы данных.
-                # Если это здание на зуме <= 13 и оно очень маленькое в градусах — пропускаем
-                if layer_name == 'building' and zoom <= 14:
-                    if (bounds[2] - bounds[0]) < pixel_size_deg and (bounds[3] - bounds[1]) < pixel_size_deg:
-                        continue
+                    if is_poly:
+                        # Ультимативное исправление сломанных полигонов
+                        simplified_geom = simplified_geom.buffer(0)
 
                 intersecting_tiles = mercantile.tiles(bounds[0], bounds[1], bounds[2], bounds[3], [zoom])
 
                 for tile in intersecting_tiles:
-                    # Переводим УЖЕ сжатую геометрию в локальные координаты
                     local_geom = project_to_mvt_pixels(simplified_geom, tile)
-
-                    # Обрезаем с небольшим буфером (mvt_bbox с запасом -128..+128)
                     clipped_geom = local_geom.intersection(mvt_bbox)
+
                     if clipped_geom.is_empty: continue
 
                     valid_geoms = []
@@ -142,7 +167,7 @@ def process_geometry_batch(batch):
 
 
 # ==========================================
-# Worker 2: MVT кодирование
+# 4. КОДИРОВАНИЕ MVT (WORKER 2)
 # ==========================================
 def process_mvt_worker(args):
     tile_key, layers_dict = args
@@ -156,44 +181,39 @@ def process_mvt_worker(args):
 
 
 # ==========================================
-# Парсер OSM (Продюсер)
+# 5. ПАРСИНГ OSM (PRODUCER)
 # ==========================================
 class FastOsmHandler(osmium.SimpleHandler):
     def __init__(self):
         super().__init__()
         self.wkbfab = osmium.geom.WKBFactory()
         self.batch = []
-        self.BATCH_SIZE = 5000  # Увеличенный батч для ускорения
+        self.BATCH_SIZE = 5000
         self.pool = mp.Pool(max(1, mp.cpu_count() - 1))
         self.async_results = []
-
-        # Индикаторы прогресса, чтобы скрипт не казался зависшим
         self.nodes_count = 0
         self.ways_count = 0
-
-        # Ограничитель очереди, чтобы не забить всю оперативную память
         self.sema = threading.Semaphore(mp.cpu_count() * 2)
 
     def node(self, n):
         self.nodes_count += 1
         if self.nodes_count % 500000 == 0:
-            print(f"\r[OSM C++ Index] Загружено узлов: {self.nodes_count}...", end="")
+            print(f"\r[OSM Index] Загружено координат: {self.nodes_count}...", end="")
 
     def _flush(self):
         if self.batch:
-            self.sema.acquire()  # Ждем, если воркеры перегружены
+            self.sema.acquire()
 
             def callback(result):
                 self.async_results.append(result)
-                self.sema.release()  # Освобождаем слот
+                self.sema.release()
 
             self.pool.apply_async(process_geometry_batch, (self.batch,), callback=callback)
             self.batch = []
 
     def way(self, w):
-        if self.ways_count == 0: print("\n[OSM Parser] Начат парсинг Линий (Ways)...")
+        if self.ways_count == 0: print("\n[OSM Parser] Обработка линий...")
         self.ways_count += 1
-
         tags = {k.k: k.v for k in w.tags}
         if get_layer_and_zoom(tags)[0]:
             try:
@@ -214,12 +234,9 @@ class FastOsmHandler(osmium.SimpleHandler):
     def finish_and_aggregate(self):
         self._flush()
         aggregated_tiles = defaultdict(lambda: defaultdict(list))
-
-        print(f"\n[Stage 1] Слияние данных по тайлам (Батчей: {len(self.async_results)})...")
-        # Закрываем пул и ждем завершения всех задач
+        print(f"\n[Stage 1] Слияние геометрии (Обработано батчей: {len(self.async_results)})...")
         self.pool.close()
         self.pool.join()
-
         for res in tqdm(self.async_results):
             for tile_key, layers_dict in res.items():
                 for layer_name, features in layers_dict.items():
@@ -227,6 +244,9 @@ class FastOsmHandler(osmium.SimpleHandler):
         return aggregated_tiles
 
 
+# ==========================================
+# 6. ЗАПИСЬ В БАЗУ ДАННЫХ
+# ==========================================
 def write_to_mbtiles(db_path, mvt_generator, total_tiles):
     if os.path.exists(db_path): os.remove(db_path)
     conn = sqlite3.connect(db_path)
@@ -254,9 +274,11 @@ def write_to_mbtiles(db_path, mvt_generator, total_tiles):
     conn.close()
 
 
+# ==========================================
+# ТОЧКА ВХОДА
+# ==========================================
 if __name__ == '__main__':
     handler = FastOsmHandler()
-    # locations=True требует времени на построение индекса в ОЗУ
     print("Инициализация библиотеки Osmium (чтение .pbf)...")
     handler.apply_file("mapfiles/cyprus.osm.pbf", locations=True, idx='flex_mem')
 
