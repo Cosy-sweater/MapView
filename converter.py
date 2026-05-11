@@ -27,6 +27,7 @@ MAX_DB_ZOOM = max(ZOOMS) if ZOOMS else 14
 
 TOLERANCES_LINES = CONFIG.get('tolerances', {}).get('lines', {})
 TOLERANCES_POLYS = CONFIG.get('tolerances', {}).get('polygons', {})
+BUILDING_MIN_PIXELS = CONFIG.get('layers', {}).get('building', {}).get('min_pixels', 2.0)
 
 HW_RULES = CONFIG.get('highways', {})
 WATER_RULES = CONFIG.get('waterways', {})
@@ -38,7 +39,7 @@ LAYER_RULES = CONFIG.get('layers', {})
 # ==========================================
 def get_layer_and_zoom(tags):
     """Определяет слой и минимальный зум на основе тегов OSM."""
-    # 1. Дороги (динамические слои: highway_motorway, highway_primary и т.д.)
+    # 1. Дороги
     if 'highway' in tags:
         hw_type = tags['highway']
         rule = HW_RULES.get(hw_type)
@@ -46,7 +47,7 @@ def get_layer_and_zoom(tags):
             min_z = rule.get('min_zoom', 14) if isinstance(rule, dict) else rule
             return f"highway_{hw_type}", min_z
 
-    # 2. Вода (Разделяем линии рек и полигоны озер)
+    # 2. Вода
     if 'waterway' in tags:
         min_z = WATER_RULES.get(tags['waterway'], 12)
         return "waterway", min_z
@@ -114,15 +115,32 @@ def process_geometry_batch(batch):
                 if zoom < effective_min_zoom: continue
 
                 pixel_size_deg = 360.0 / (256.0 * (2 ** zoom))
+                current_layer = layer_name  # Слой по умолчанию для текущего зума
 
                 # --- СЖАТИЕ ГЕОМЕТРИИ ---
-                if layer_name == 'building':
-                    # Здания сохраняем максимально точными
-                    simplified_geom = geom
-                    # Фильтр "сараев" на низких зумах
-                    if zoom <= 13 and (bounds[2] - bounds[0]) < pixel_size_deg and (
-                            bounds[3] - bounds[1]) < pixel_size_deg:
-                        continue
+                if layer_name.startswith('building'):
+                    width = bounds[2] - bounds[0]
+                    height = bounds[3] - bounds[1]
+
+                    # 1. Удаление слишком мелких зданий
+                    if (width < pixel_size_deg * BUILDING_MIN_PIXELS) and (
+                            height < pixel_size_deg * BUILDING_MIN_PIXELS):
+                        continue  # Полностью пропускаем этот полигон для данного зума
+
+                    # 2. Упрощение геометрии
+                    if zoom <= 13:
+                        # На средних зумах превращаем здания в простые прямоугольники
+                        simplified_geom = geom.minimum_rotated_rectangle
+                    else:
+                        # На 14+ зуме оставляем оригинальную форму или слегка сглаживаем
+                        simplified_geom = geom.simplify(pixel_size_deg * 0.1, preserve_topology=True)
+
+                    # 3. Присвоение правильного тега слоя для рендерера
+                    # Если здание больше 5 пикселей - оно большое
+                    if width > (pixel_size_deg * 5) or height > (pixel_size_deg * 5):
+                        current_layer = 'building_large'
+                    else:
+                        current_layer = 'building_small'
                 else:
                     base_tol = TOLERANCES_POLYS.get(zoom, 1.0) if is_poly else TOLERANCES_LINES.get(zoom, 1.0)
                     tolerance = pixel_size_deg * base_tol
@@ -133,7 +151,7 @@ def process_geometry_batch(batch):
 
                 if simplified_geom.is_empty: continue
 
-                # --- ЛЕЧЕНИЕ ЗЕЛЕНИ ---
+                # --- ЛЕЧЕНИЕ ЗЕЛЕНИ И ПОЛИГОНОВ ---
                 if not simplified_geom.is_valid:
                     simplified_geom = make_valid(simplified_geom)
                     if is_poly:
@@ -156,7 +174,8 @@ def process_geometry_batch(batch):
                         valid_geoms = [clipped_geom]
 
                     for g in valid_geoms:
-                        results[(zoom, tile.x, tile.y)][layer_name].append({
+                        # Записываем в current_layer, чтобы отделить building_large от building_small
+                        results[(zoom, tile.x, tile.y)][current_layer].append({
                             'geometry': mapping(g),
                             'properties': tags_dict
                         })

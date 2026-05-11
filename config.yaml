@@ -20,5 +20,5 @@ highways:
   motorway: { min_zoom: 6, priority: 1 }
   trunk: { min_zoom: 6, priority: 2 }
   primary: { min_zoom: 7, priority: 3 }
-  secondary: { min_zoom: 9, priority: 4 }
-  residential: { min_zoom: 12, priority: 5 }
+  secondary: { min_zoom: 10, priority: 4 }
+  residential: { min_zoom: 14, priority: 5 }

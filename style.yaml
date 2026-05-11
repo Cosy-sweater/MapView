@@ -21,7 +21,7 @@ layers:
     width: 3.0
     z_min: 7
   highway_residential:
-    color: '#FFFFFF'
+    color: '#fff5bb'
     width: 1.5
     z_min: 12
   highway_secondary:
@@ -29,7 +29,7 @@ layers:
     width: 2.5
     z_min: 9
   highway_service:
-    color: '#FFFFFF'
+    color: '#feffca'
     width: 1.0
     z_min: 14
   highway_tertiary:
@@ -41,7 +41,7 @@ layers:
     width: 3.5
     z_min: 6
   highway_unclassified:
-    color: '#FFFFFF'
+    color: '#e6ebff'
     width: 1.5
     z_min: 11
   landmass:

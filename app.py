@@ -770,6 +770,7 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setAttribute(Qt.AA_UseOpenGLES)
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
