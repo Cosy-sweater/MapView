@@ -16,60 +16,55 @@ from tqdm import tqdm
 
 MVT_EXTENT = 4096
 
-# ==========================================
-# 1. КОНФИГУРАЦИЯ И КОНСТАНТЫ
-# ==========================================
 with open("config.yaml", 'r', encoding='utf-8') as f:
     CONFIG = yaml.safe_load(f)
 
-ZOOMS = CONFIG.get('zooms', [6, 8, 10, 12, 14])
-MAX_DB_ZOOM = max(ZOOMS) if ZOOMS else 14
+ZOOMS = CONFIG.get('zooms', [6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+MAX_DB_ZOOM = max(ZOOMS) if ZOOMS else 15
 
 TOLERANCES_LINES = CONFIG.get('tolerances', {}).get('lines', {})
 TOLERANCES_POLYS = CONFIG.get('tolerances', {}).get('polygons', {})
-BUILDING_MIN_PIXELS = CONFIG.get('layers', {}).get('building', {}).get('min_pixels', 2.0)
-
-HW_RULES = CONFIG.get('highways', {})
-WATER_RULES = CONFIG.get('waterways', {})
-LAYER_RULES = CONFIG.get('layers', {})
 
 
-# ==========================================
-# 2. ПРАВИЛА СЛОЕВ И ТЕГОВ
-# ==========================================
 def get_layer_and_zoom(tags):
     """Определяет слой и минимальный зум на основе тегов OSM."""
-    # 1. Дороги
+
     if 'highway' in tags:
-        hw_type = tags['highway']
-        rule = HW_RULES.get(hw_type)
-        if rule:
-            min_z = rule.get('min_zoom', 14) if isinstance(rule, dict) else rule
-            return f"highway_{hw_type}", min_z
+        hw = tags['highway']
+        if hw in ['motorway', 'trunk']: return f"highway_{hw}", 6
+        if hw in ['primary', 'secondary']: return f"highway_{hw}", 8
+        if hw in ['tertiary', 'unclassified', 'residential']: return f"highway_{hw}", 11
+        if hw in ['service', 'pedestrian', 'path', 'footway', 'cycleway']: return "highway_minor", 13
 
-    # 2. Вода
+    if 'railway' in tags and tags['railway'] == 'rail':
+        return "railway", 10
+
     if 'waterway' in tags:
-        min_z = WATER_RULES.get(tags['waterway'], 12)
-        return "waterway", min_z
-    if tags.get('natural') == 'water' or tags.get('landuse') == 'reservoir':
-        min_z = LAYER_RULES.get('water', {}).get('min_zoom', 6)
-        return "water_poly", min_z
+        return "waterway", 10
+    if tags.get('natural') in ['water', 'bay'] or tags.get('landuse') == 'reservoir':
+        return "water_poly", 6
 
-    # 3. Здания
     if 'building' in tags:
-        min_z = LAYER_RULES.get('building', {}).get('min_zoom', 14)
-        return "building", min_z
+        return "building", 13
 
-    # 4. Природа (леса, парки)
-    if tags.get('natural') in ['wood', 'forest'] or tags.get('landuse') in ['forest', 'grass', 'meadow']:
-        min_z = LAYER_RULES.get('natural', {}).get('min_zoom', 6)
-        return "greenery", min_z
+    if tags.get('natural') in ['wood', 'scrub', 'heath', 'grassland'] or tags.get('landuse') in ['forest', 'grass',
+                                                                                                 'meadow']:
+        return "greenery", 8
+    if tags.get('leisure') in ['park', 'garden', 'pitch', 'nature_reserve']:
+        return "greenery", 10
+
+    if 'landuse' in tags:
+        lu = tags['landuse']
+        if lu in ['residential', 'commercial', 'industrial', 'farmland', 'cemetery']:
+            return f"landuse_{lu}", 10
+
+    if tags.get('amenity') in ['parking', 'university', 'school', 'hospital']:
+        return "amenity_area", 13
 
     return None, 99
 
 
 def project_to_mvt_pixels(geom, tile):
-    """Переводит координаты из градусов в локальную пиксельную сетку тайла 0..4096."""
     bounds = mercantile.xy_bounds(tile)
     w, s, e, n = bounds.left, bounds.bottom, bounds.right, bounds.top
 
@@ -86,13 +81,8 @@ def project_to_mvt_pixels(geom, tile):
     return transform(transform_coords, geom)
 
 
-# ==========================================
-# 3. МАТЕМАТИКА ГЕОМЕТРИИ (WORKER 1)
-# ==========================================
 def process_geometry_batch(batch):
-    """Параллельный воркер: фильтрует, сжимает и нарезает геометрию на тайлы."""
     results = defaultdict(lambda: defaultdict(list))
-    # Увеличенный буфер обрезки (256 единиц), предотвращает артефакты на границах тайлов
     mvt_bbox = box(-256, -256, MVT_EXTENT + 256, MVT_EXTENT + 256)
 
     for wkb_hex, tags_dict in batch:
@@ -101,62 +91,36 @@ def process_geometry_batch(batch):
             if not layer_name: continue
 
             geom = load_wkb(wkb_hex, hex=True)
-            if not geom.is_valid:
-                geom = make_valid(geom)
+            if not geom.is_valid: geom = make_valid(geom)
             if geom.is_empty: continue
 
             bounds = geom.bounds
             is_poly = geom.geom_type in ['Polygon', 'MultiPolygon']
-
-            # Защита от Overzooming: пакуем объекты в максимальный доступный слой БД
             effective_min_zoom = min(min_zoom, MAX_DB_ZOOM)
 
             for zoom in ZOOMS:
                 if zoom < effective_min_zoom: continue
 
                 pixel_size_deg = 360.0 / (256.0 * (2 ** zoom))
-                current_layer = layer_name  # Слой по умолчанию для текущего зума
 
-                # --- СЖАТИЕ ГЕОМЕТРИИ ---
-                if layer_name.startswith('building'):
-                    width = bounds[2] - bounds[0]
-                    height = bounds[3] - bounds[1]
+                # Адаптивное сжатие: здания сжимаем очень слабо (0.2), чтобы не исказить форму
+                tol_multiplier = 1.0
+                if layer_name.startswith('highway'):
+                    tol_multiplier = 0.5
+                elif layer_name == 'building':
+                    tol_multiplier = 0.2
+                elif layer_name == 'waterway':
+                    tol_multiplier = 1.5
 
-                    # 1. Удаление слишком мелких зданий
-                    if (width < pixel_size_deg * BUILDING_MIN_PIXELS) and (
-                            height < pixel_size_deg * BUILDING_MIN_PIXELS):
-                        continue  # Полностью пропускаем этот полигон для данного зума
+                base_tol = TOLERANCES_POLYS.get(zoom, 1.0) if is_poly else TOLERANCES_LINES.get(zoom, 1.0)
+                tolerance = pixel_size_deg * base_tol * tol_multiplier
 
-                    # 2. Упрощение геометрии
-                    if zoom <= 13:
-                        # На средних зумах превращаем здания в простые прямоугольники
-                        simplified_geom = geom.minimum_rotated_rectangle
-                    else:
-                        # На 14+ зуме оставляем оригинальную форму или слегка сглаживаем
-                        simplified_geom = geom.simplify(pixel_size_deg * 0.1, preserve_topology=True)
-
-                    # 3. Присвоение правильного тега слоя для рендерера
-                    # Если здание больше 5 пикселей - оно большое
-                    if width > (pixel_size_deg * 5) or height > (pixel_size_deg * 5):
-                        current_layer = 'building_large'
-                    else:
-                        current_layer = 'building_small'
-                else:
-                    base_tol = TOLERANCES_POLYS.get(zoom, 1.0) if is_poly else TOLERANCES_LINES.get(zoom, 1.0)
-                    tolerance = pixel_size_deg * base_tol
-
-                    # Отключаем preserve_topology на мелких зумах, чтобы агрессивно резать сложные петли рек
-                    preserve = True if zoom >= 12 else False
-                    simplified_geom = geom.simplify(tolerance, preserve_topology=preserve)
+                # Топологию полигонов сохраняем всегда, чтобы леса не исчезали
+                preserve = True if is_poly or zoom >= 12 else False
+                simplified_geom = geom.simplify(tolerance, preserve_topology=preserve)
 
                 if simplified_geom.is_empty: continue
-
-                # --- ЛЕЧЕНИЕ ЗЕЛЕНИ И ПОЛИГОНОВ ---
-                if not simplified_geom.is_valid:
-                    simplified_geom = make_valid(simplified_geom)
-                    if is_poly:
-                        # Ультимативное исправление сломанных полигонов
-                        simplified_geom = simplified_geom.buffer(0)
+                if not simplified_geom.is_valid: simplified_geom = make_valid(simplified_geom)
 
                 intersecting_tiles = mercantile.tiles(bounds[0], bounds[1], bounds[2], bounds[3], [zoom])
 
@@ -174,8 +138,7 @@ def process_geometry_batch(batch):
                         valid_geoms = [clipped_geom]
 
                     for g in valid_geoms:
-                        # Записываем в current_layer, чтобы отделить building_large от building_small
-                        results[(zoom, tile.x, tile.y)][current_layer].append({
+                        results[(zoom, tile.x, tile.y)][layer_name].append({
                             'geometry': mapping(g),
                             'properties': tags_dict
                         })
@@ -184,10 +147,6 @@ def process_geometry_batch(batch):
 
     return {k: dict(v) for k, v in results.items()}
 
-
-# ==========================================
-# 4. КОДИРОВАНИЕ MVT (WORKER 2)
-# ==========================================
 def process_mvt_worker(args):
     tile_key, layers_dict = args
     z, x, y = tile_key
@@ -199,9 +158,6 @@ def process_mvt_worker(args):
         return None
 
 
-# ==========================================
-# 5. ПАРСИНГ OSM (PRODUCER)
-# ==========================================
 class FastOsmHandler(osmium.SimpleHandler):
     def __init__(self):
         super().__init__()
@@ -263,9 +219,6 @@ class FastOsmHandler(osmium.SimpleHandler):
         return aggregated_tiles
 
 
-# ==========================================
-# 6. ЗАПИСЬ В БАЗУ ДАННЫХ
-# ==========================================
 def write_to_mbtiles(db_path, mvt_generator, total_tiles):
     if os.path.exists(db_path): os.remove(db_path)
     conn = sqlite3.connect(db_path)
@@ -285,7 +238,6 @@ def write_to_mbtiles(db_path, mvt_generator, total_tiles):
             if len(batch) >= 500:
                 cursor.executemany("INSERT INTO tiles VALUES (?, ?, ?, ?)", batch)
                 batch = []
-
     if batch: cursor.executemany("INSERT INTO tiles VALUES (?, ?, ?, ?)", batch)
     conn.commit()
     conn.isolation_level = None

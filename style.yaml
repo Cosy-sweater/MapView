@@ -1,56 +1,115 @@
 layers:
-  building_large:
-    color: '#B4B3B1'
-    fill: '#D9D8D6'
-    width: 0.5
-    z_min: 13
-  building_small:
-    color: '#C4C3C1'
-    fill: '#D9D8D6'
-    width: 0.5
-    z_min: 14
-  greenery:
-    fill: '#C2DCA8'
-    z_min: 6
-  highway_motorway:
-    color: '#E892A2'
-    width: 4.0
-    z_min: 6
-  highway_primary:
-    color: '#FCD6A4'
-    width: 3.0
-    z_min: 7
-  highway_residential:
-    color: '#fff5bb'
-    width: 1.5
-    z_min: 12
-  highway_secondary:
-    color: '#F6CFA6'
-    width: 2.5
-    z_min: 9
-  highway_service:
-    color: '#feffca'
-    width: 1.0
-    z_min: 14
-  highway_tertiary:
-    color: '#FFFFB3'
-    width: 2.0
-    z_min: 10
-  highway_trunk:
-    color: '#F9B29C'
-    width: 3.5
-    z_min: 6
-  highway_unclassified:
-    color: '#e6ebff'
-    width: 1.5
-    z_min: 11
   landmass:
     fill: '#F2EFE9'
+    visible: true
+    z_index: 5
     z_min: 6
+
+  landuse_farmland:
+    fill: '#EAE6D2'
+    visible: true
+    z_index: 10
+    z_min: 10
+  landuse_residential:
+    fill: '#E3DFD9'
+    visible: true
+    z_index: 11
+    z_min: 10
+  landuse_commercial:
+    fill: '#DCDAE1'
+    visible: true
+    z_index: 12
+    z_min: 10
+  landuse_industrial:
+    fill: '#DFD5D6'
+    visible: true
+    z_index: 13
+    z_min: 10
+
+  greenery:
+    fill: '#C2DCA8'
+    visible: true
+    z_index: 15
+    z_min: 6
+
   water_poly:
     fill: '#74A0C2'
+    visible: true
+    z_index: 20
     z_min: 6
   waterway:
     color: '#74A0C2'
+    visible: true
     width: 1.5
+    z_index: 21
+    z_min: 10
+
+  amenity_area:
+    fill: '#F5F3E6'
+    visible: true
+    z_index: 30
+    z_min: 13
+
+  building:
+    color: '#B4B3B1'
+    fill: '#D9D8D6'
+    visible: true
+    width: 0.5
+    z_index: 50
+    z_min: 13
+
+  highway_minor:
+    color: '#FFFFFF'
+    visible: true
+    width: 1.0
+    z_index: 60
+    z_min: 13
+  highway_residential:
+    color: '#FFFFFF'
+    visible: true
+    width: 1.5
+    z_index: 61
+    z_min: 11
+  highway_unclassified:
+    color: '#FFFFFF'
+    visible: true
+    width: 1.5
+    z_index: 62
+    z_min: 11
+  highway_tertiary:
+    color: '#FFFFB3'
+    visible: true
+    width: 2.0
+    z_index: 65
+    z_min: 10
+  highway_secondary:
+    color: '#F6CFA6'
+    visible: true
+    width: 2.5
+    z_index: 70
+    z_min: 8
+  highway_primary:
+    color: '#FCD6A4'
+    visible: true
+    width: 3.0
+    z_index: 75
     z_min: 7
+  highway_trunk:
+    color: '#F9B29C'
+    visible: true
+    width: 3.5
+    z_index: 80
+    z_min: 6
+  highway_motorway:
+    color: '#E892A2'
+    visible: true
+    width: 4.0
+    z_index: 85
+    z_min: 6
+
+  railway:
+    color: '#999999'
+    visible: true
+    width: 1.5
+    z_index: 90
+    z_min: 10

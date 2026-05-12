@@ -13,13 +13,12 @@ import mapbox_vector_tile
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QOpenGLWidget, QVBoxLayout,
                              QWidget, QPushButton, QHBoxLayout, QFileDialog,
                              QTextEdit, QMessageBox, QLineEdit, QLabel, QDialog,
-                             QScrollArea, QFormLayout, QColorDialog, QDoubleSpinBox)
-from PyQt5.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QFont, QTextCursor
-from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
+                             QScrollArea, QFormLayout, QColorDialog, QDoubleSpinBox, QInputDialog, QCheckBox, QSpinBox,
+                             QGridLayout, QComboBox)
+from PyQt5.QtGui import QPainter, QPainterPath, QColor, QPen, QBrush, QFont, QTextCursor, QImage, QPixmap
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer, QRectF
 
-# ==========================================
-# Настройки и Файловая система
-# ==========================================
+
 TILE_SIZE = 256
 MVT_EXTENT = 4096
 MVT_SCALE = TILE_SIZE / MVT_EXTENT
@@ -53,27 +52,15 @@ LAYER_PRIORITY = {
 
 DEFAULT_STYLES = {
     'layers': {
-        'landmass': {'fill': '#F2EFE9', 'z_min': 6},
-        'greenery': {'fill': '#C2DCA8', 'z_min': 6},
-        'water_poly': {'fill': '#74A0C2', 'z_min': 6},
-        'waterway': {'color': '#74A0C2', 'width': 1.5, 'z_min': 7},
-        'building_large': {'fill': '#D9D8D6', 'color': '#B4B3B1', 'width': 0.5, 'z_min': 13},
-        'building_small': {'fill': '#D9D8D6', 'color': '#C4C3C1', 'width': 0.5, 'z_min': 14},
-        'highway_service': {'color': '#FFFFFF', 'width': 1.0, 'z_min': 14},
-        'highway_residential': {'color': '#FFFFFF', 'width': 1.5, 'z_min': 12},
-        'highway_unclassified': {'color': '#FFFFFF', 'width': 1.5, 'z_min': 11},
-        'highway_tertiary': {'color': '#FFFFB3', 'width': 2.0, 'z_min': 10},
-        'highway_secondary': {'color': '#F6CFA6', 'width': 2.5, 'z_min': 9},
-        'highway_primary': {'color': '#FCD6A4', 'width': 3.0, 'z_min': 7},
-        'highway_trunk': {'color': '#F9B29C', 'width': 3.5, 'z_min': 6},
-        'highway_motorway': {'color': '#E892A2', 'width': 4.0, 'z_min': 6}
+        'landmass': {'fill': '#F2EFE9', 'z_min': 6, 'z_index': 5, 'visible': True},
+        'water_poly': {'fill': '#74A0C2', 'z_min': 6, 'z_index': 20, 'visible': True},
+        'building_large': {'fill': '#D9D8D6', 'color': '#B4B3B1', 'width': 0.5, 'z_min': 13, 'z_index': 50,
+                           'visible': True},
+        'highway_primary': {'color': '#FCD6A4', 'width': 3.0, 'z_min': 7, 'z_index': 45, 'visible': True},
     }
 }
 
 
-# ==========================================
-# Утилиты
-# ==========================================
 class EmittingStream(QObject):
     textWritten = pyqtSignal(str)
 
@@ -111,7 +98,6 @@ class StyleManager:
     def load_styles(self):
         if not os.path.exists(self.config_path):
             self.reset_to_defaults()
-
         try:
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 self.rules = yaml.safe_load(f).get('layers', {})
@@ -130,127 +116,140 @@ class StyleManager:
 
     def get_style(self, layer_name, zoom):
         rule = self.rules.get(layer_name)
-        if rule and zoom >= rule.get('z_min', 0):
+        if rule and rule.get('visible', True) and zoom >= rule.get('z_min', 0):
             return rule
         return None
 
+    def get_priority(self, layer_name):
+        rule = self.rules.get(layer_name)
+        return rule.get('z_index', 0) if rule else 0
 
-# ==========================================
-# Окно Редактора Стилей
-# ==========================================
+
 class StyleEditorDialog(QDialog):
     def __init__(self, style_manager, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Редактор стилей (style.yaml)")
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.resize(500, 600)
-        self.style_manager = style_manager
-
+        self.setWindowTitle("Редактор стилей")
+        self.resize(850, 500)
+        self.sm = style_manager
         self.inputs = {}
+
         layout = QVBoxLayout(self)
+
+        top_layout = QHBoxLayout()
+        self.combo = QComboBox()
+        self.combo.setEditable(True)
+        self.combo.addItems([
+            "landmass", "water_poly", "waterway", "greenery", "building_large", "building_small",
+            "highway_motorway", "highway_trunk", "highway_primary", "highway_secondary",
+            "highway_tertiary", "highway_residential", "highway_unclassified", "highway_service"
+        ])
+        btn_add = QPushButton("➕ Добавить слой")
+        btn_add.clicked.connect(self.add_layer)
+        top_layout.addWidget(self.combo)
+        top_layout.addWidget(btn_add)
+        layout.addLayout(top_layout)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        form_widget = QWidget()
-        self.form_layout = QFormLayout(form_widget)
-
-        self.populate_form()
-
-        scroll.setWidget(form_widget)
+        w = QWidget()
+        self.grid = QGridLayout(w)
+        self.grid.setAlignment(Qt.AlignTop)  # Прижим к верху
+        scroll.setWidget(w)
         layout.addWidget(scroll)
 
-        btn_layout = QHBoxLayout()
-        btn_save = QPushButton("💾 Сохранить стили")
-        btn_save.clicked.connect(self.save_and_close)
+        btn_save = QPushButton("💾 Сохранить и Применить")
+        btn_save.setStyleSheet("background-color: #2e7d32; color: white; padding: 8px;")
+        btn_save.clicked.connect(self.save)
+        layout.addWidget(btn_save)
 
-        btn_reset = QPushButton("⚠️ Сбросить по умолчанию")
-        btn_reset.clicked.connect(self.reset_styles)
-        btn_reset.setStyleSheet("background-color: #A00; color: white;")
+        self.refresh()
 
-        btn_layout.addWidget(btn_save)
-        btn_layout.addWidget(btn_reset)
-        layout.addLayout(btn_layout)
-
-    def populate_form(self):
-        while self.form_layout.count():
-            item = self.form_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None: widget.deleteLater()
-
+    def refresh(self):
+        for i in reversed(range(self.grid.count())):
+            self.grid.itemAt(i).widget().setParent(None)
         self.inputs.clear()
 
-        for layer_name, props in self.style_manager.rules.items():
-            row_widget = QWidget()
-            row_layout = QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(0, 0, 0, 0)
+        for col, h in enumerate(["Вкл", "Слой", "Z-Index", "Min Z", "Заливка", "Линия", "Толщ.", ""]):
+            self.grid.addWidget(QLabel(f"<b>{h}</b>"), 0, col)
 
-            self.inputs[layer_name] = {}
+        layers = sorted(self.sm.rules.items(), key=lambda x: x[1].get('z_index', 0), reverse=True)
+        for r, (name, props) in enumerate(layers, start=1):
+            self.inputs[name] = {}
 
-            if 'fill' in props:
-                btn_fill = self.create_color_button(props['fill'])
-                row_layout.addWidget(QLabel("Заливка:"))
-                row_layout.addWidget(btn_fill)
-                self.inputs[layer_name]['fill'] = btn_fill
+            def add_w(col, widget, key=None):
+                self.grid.addWidget(widget, r, col)
+                if key: self.inputs[name][key] = widget
 
-            if 'color' in props:
-                btn_color = self.create_color_button(props['color'])
-                row_layout.addWidget(QLabel("Линия:"))
-                row_layout.addWidget(btn_color)
-                self.inputs[layer_name]['color'] = btn_color
+            chk = QCheckBox();
+            chk.setChecked(props.get('visible', True))
+            add_w(0, chk, 'visible')
 
-            if 'width' in props:
-                spin_w = QDoubleSpinBox()
-                spin_w.setRange(0.1, 10.0)
-                spin_w.setSingleStep(0.5)
-                spin_w.setValue(props['width'])
-                row_layout.addWidget(QLabel("Толщина:"))
-                row_layout.addWidget(spin_w)
-                self.inputs[layer_name]['width'] = spin_w
+            add_w(1, QLabel(name))
 
-            row_layout.addStretch()
-            self.form_layout.addRow(f"<b>{layer_name}</b>", row_widget)
+            sz = QSpinBox();
+            sz.setRange(0, 999);
+            sz.setValue(props.get('z_index', 10))
+            add_w(2, sz, 'z_index')
 
-    def create_color_button(self, hex_color):
-        btn = QPushButton()
-        btn.setFixedSize(30, 20)
-        btn.setStyleSheet(f"background-color: {hex_color}; border: 1px solid black;")
-        btn.color_val = hex_color
+            smz = QSpinBox();
+            smz.setRange(0, 22);
+            smz.setValue(props.get('z_min', 0))
+            add_w(3, smz, 'z_min')
 
-        def pick_color():
-            color = QColorDialog.getColor(QColor(btn.color_val), self, "Выберите цвет",
-                                          QColorDialog.DontUseNativeDialog)
-            if color.isValid():
-                btn.color_val = color.name()
-                btn.setStyleSheet(f"background-color: {btn.color_val}; border: 1px solid black;")
+            add_w(4, self.color_btn(props.get('fill', '')), 'fill')
+            add_w(5, self.color_btn(props.get('color', '')), 'color')
 
-        btn.clicked.connect(pick_color)
-        return btn
+            sw = QDoubleSpinBox();
+            sw.setSingleStep(0.5);
+            sw.setValue(props.get('width', 0.0))
+            add_w(6, sw, 'width')
 
-    def save_and_close(self):
-        new_rules = {}
-        for layer_name, old_props in self.style_manager.rules.items():
-            new_rules[layer_name] = old_props.copy()
-            if 'fill' in self.inputs[layer_name]: new_rules[layer_name]['fill'] = self.inputs[layer_name][
-                'fill'].color_val
-            if 'color' in self.inputs[layer_name]: new_rules[layer_name]['color'] = self.inputs[layer_name][
-                'color'].color_val
-            if 'width' in self.inputs[layer_name]: new_rules[layer_name]['width'] = self.inputs[layer_name][
-                'width'].value()
+            b_del = QPushButton("Х");
+            b_del.clicked.connect(lambda _, n=name: self.delete(n))
+            add_w(7, b_del)
 
-        self.style_manager.save_styles(new_rules)
+    def color_btn(self, hex_c):
+        b = QPushButton()
+        b.c_val = hex_c
+        b.setFixedSize(40, 20)
+        b.setStyleSheet(f"background: {hex_c if hex_c else 'transparent'}; border: 1px solid gray;")
+        b.clicked.connect(lambda: self.pick_color(b))
+        return b
+
+    def pick_color(self, btn):
+        c = QColorDialog.getColor(QColor(btn.c_val) if btn.c_val else Qt.white, self)
+        if c.isValid():
+            btn.c_val = c.name()
+            btn.setStyleSheet(f"background: {btn.c_val}; border: 1px solid black;")
+
+    def add_layer(self):
+        name = self.combo.currentText().strip()
+        if name and name not in self.sm.rules:
+            self.sm.rules[name] = {'visible': True, 'z_index': 10, 'z_min': 0}
+            self.refresh()
+
+    def delete(self, name):
+        if name in self.sm.rules:
+            del self.sm.rules[name]
+            self.refresh()
+
+    def save(self):
+        for name, w in self.inputs.items():
+            self.sm.rules[name].update({
+                'visible': w['visible'].isChecked(), 'z_index': w['z_index'].value(),
+                'z_min': w['z_min'].value(), 'width': w['width'].value()
+            })
+            for c_type in ('fill', 'color'):
+                val = w[c_type].c_val
+                if val:
+                    self.sm.rules[name][c_type] = val
+                elif c_type in self.sm.rules[name]:
+                    del self.sm.rules[name][c_type]
+
+        self.sm.save_styles(self.sm.rules)
         self.accept()
 
-    def reset_styles(self):
-        reply = QMessageBox.question(self, 'Сброс', 'Точно сбросить все стили к стандартным?',
-                                     QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            self.style_manager.reset_to_defaults()
-            self.populate_form()
 
-
-# ==========================================
-# Окно Конвертера
-# ==========================================
 class ConverterWindow(QWidget):
     conversion_finished = pyqtSignal(str)
 
@@ -283,7 +282,7 @@ class ConverterWindow(QWidget):
 
         self.log_console = QTextEdit()
         self.log_console.setReadOnly(True)
-        self.log_console.setTextInteractionFlags(Qt.NoTextInteraction)  # ЗАЩИТА ОТ КЛИКОВ (Логи не сбиваются)
+        self.log_console.setTextInteractionFlags(Qt.NoTextInteraction)
         self.log_console.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: Consolas;")
         layout.addWidget(self.log_console)
 
@@ -361,17 +360,15 @@ class ConverterWindow(QWidget):
         event.accept()
 
 
-# ==========================================
-# Асинхронный Загрузчик (WorkerSignals & TileLoader)
-# ==========================================
 class WorkerSignals(QObject):
-    tile_decoded = pyqtSignal(tuple, list)
+    tile_decoded = pyqtSignal(tuple, QImage)
 
 
 class TileLoader:
-    def __init__(self, db_path, cache_ref):
+    def __init__(self, db_path, cache_ref, style_manager):
         self.db_path = db_path
         self.cache = cache_ref
+        self.style_manager = style_manager
         self.task_queue = queue.PriorityQueue()
         self.signals = WorkerSignals()
         self.active_workers = True
@@ -393,7 +390,6 @@ class TileLoader:
             except:
                 pass
 
-        # Надежное закрытие потоков и SQLite базы
         for t in self.threads:
             if t.is_alive():
                 t.join(timeout=1.0)
@@ -428,13 +424,51 @@ class TileLoader:
                                (z, x, tms_y))
                 row = cursor.fetchone()
 
-                compiled_features = []
+                HI_RES_FACTOR = 2.0
+                img_size = int(TILE_SIZE * HI_RES_FACTOR)
+                image = QImage(img_size, img_size, QImage.Format_ARGB32_Premultiplied)
+                image.fill(Qt.transparent)
+
                 if row:
                     raw_data = zlib.decompress(row[0])
                     decoded = mapbox_vector_tile.decode(raw_data)
                     compiled_features = self._build_hardware_paths(decoded)
 
-                self.signals.tile_decoded.emit(tile_key, compiled_features)
+                    painter = QPainter(image)
+                    painter.setRenderHint(QPainter.Antialiasing)
+                    painter.scale(HI_RES_FACTOR, HI_RES_FACTOR)
+
+                    valid_features = []
+                    for feat in compiled_features:
+                        rule = self.style_manager.get_style(feat.get('layer_name', ''), z)
+                        if rule:
+                            valid_features.append((feat, rule))
+
+                    sorted_features = sorted(valid_features, key=lambda item: item[1].get('z_index', 0))
+
+                    for feat, rule in sorted_features:
+                        l_name = feat.get('layer_name', '')
+
+                        if feat['type'] == 'Polygon' and l_name.startswith('building'):
+                            rect = feat['path'].boundingRect()
+                            if rect.width() < 2.5 and rect.height() < 2.5: continue
+
+                        pen, brush = QPen(Qt.NoPen), QBrush(Qt.NoBrush)
+                        if 'color' in rule:
+                            pen = QPen(QColor(rule['color']), rule.get('width', 1.0))
+                            pen.setJoinStyle(Qt.RoundJoin)
+                            pen.setCapStyle(Qt.RoundCap)
+                            pen.setCosmetic(True)
+                        if 'fill' in rule and feat['type'] == 'Polygon':
+                            brush = QBrush(QColor(rule['fill']))
+
+                        painter.setPen(pen)
+                        painter.setBrush(brush)
+                        painter.drawPath(feat['path'])
+
+                    painter.end()
+
+                self.signals.tile_decoded.emit(tile_key, image)
                 self.loading_tiles.discard(tile_key)
                 self.task_queue.task_done()
             except queue.Empty:
@@ -457,6 +491,7 @@ class TileLoader:
                     path.moveTo(coords[0][0] * MVT_SCALE, coords[0][1] * MVT_SCALE)
                     for pt in coords[1:]: path.lineTo(pt[0] * MVT_SCALE, pt[1] * MVT_SCALE)
                 elif geom_type == 'Polygon':
+                    path.setFillRule(Qt.OddEvenFill)  # [cite: 36, 2816, 2833]
                     for ring in coords:
                         path.moveTo(ring[0][0] * MVT_SCALE, ring[0][1] * MVT_SCALE)
                         for pt in ring[1:]: path.lineTo(pt[0] * MVT_SCALE, pt[1] * MVT_SCALE)
@@ -467,9 +502,6 @@ class TileLoader:
         return features_data
 
 
-# ==========================================
-# Отрисовка Карты
-# ==========================================
 class MapCanvas(QOpenGLWidget):
     def __init__(self):
         super().__init__()
@@ -477,7 +509,6 @@ class MapCanvas(QOpenGLWidget):
         self.setUpdateBehavior(QOpenGLWidget.PartialUpdate)
         self.style_manager = StyleManager()
 
-        # Замена LRUCache на стандартный dict (Свой механизм сборки мусора)
         self.tile_cache = {}
         self.loader = None
         self.db_path = None
@@ -488,8 +519,12 @@ class MapCanvas(QOpenGLWidget):
         self.dragging = False
         self.last_mouse_pos = None
 
+        self.request_timer = QTimer(self)
+        self.request_timer.setSingleShot(True)
+        self.request_timer.setInterval(200)  # 0.2 секунды
+        self.request_timer.timeout.connect(self._queue_visible_tiles)
+
     def _auto_center(self, db_path):
-        """Математически вычисляет центр региона по данным из БД"""
         try:
             conn = sqlite3.connect(db_path)
             c = conn.cursor()
@@ -527,9 +562,11 @@ class MapCanvas(QOpenGLWidget):
         if os.path.exists(db_path):
             self.db_path = db_path
             self._auto_center(db_path)
-            self.loader = TileLoader(db_path, self.tile_cache)
+            # Передаем style_manager в Worker
+            self.loader = TileLoader(db_path, self.tile_cache, self.style_manager)
             self.loader.signals.tile_decoded.connect(self.on_tile_decoded)
             self.update()
+            self.request_timer.start(0)
 
     def unload_database(self):
         if self.loader:
@@ -540,42 +577,33 @@ class MapCanvas(QOpenGLWidget):
         self.update()
 
     def clean_cache(self):
-        """Умная очистка кэша (Spatial Eviction Policy)"""
         if len(self.tile_cache) <= MAX_CACHE_TILES:
             return
 
         current_z = int(math.floor(self.zoom))
 
-        # Оценка бесполезности тайла
         def get_score(key):
             z, x, y = key
             z_diff = abs(z - current_z)
-
-            # Перевод тайла в координаты для расчета дистанции до центра
             n = 2.0 ** z
             tile_lon = (x + 0.5) / n * 360.0 - 180.0
             lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * (y + 0.5) / n)))
             tile_lat = math.degrees(lat_rad)
-
             dist_sq = (tile_lon - self.center_lon) ** 2 + (tile_lat - self.center_lat) ** 2
             return (z_diff, dist_sq)
 
-        # Сортируем тайлы: сначала удаляем другие зумы, затем дальние по дистанции
         sorted_keys = sorted(self.tile_cache.keys(), key=get_score, reverse=True)
-
         tiles_to_delete = len(self.tile_cache) - TARGET_CACHE_TILES
         deleted = 0
 
         for k in sorted_keys:
             if deleted >= tiles_to_delete: break
             if self.loader and k in self.loader.visible_tiles: continue
-
             del self.tile_cache[k]
             deleted += 1
 
-    def on_tile_decoded(self, tile_key, compiled_features):
-        self.tile_cache[tile_key] = compiled_features
-        # Запускаем сборку мусора при добавлении нового тайла
+    def on_tile_decoded(self, tile_key, image):
+        self.tile_cache[tile_key] = QPixmap.fromImage(image)
         self.clean_cache()
         self.update()
 
@@ -594,24 +622,16 @@ class MapCanvas(QOpenGLWidget):
             self.center_lon -= delta.x() / ((TILE_SIZE * (2 ** self.zoom)) / 360.0)
             self.center_lat += delta.y() / ((TILE_SIZE * (2 ** self.zoom)) / 180.0)
             self.last_mouse_pos = event.pos()
+
             self.update()
+            self.request_timer.start()
 
     def wheelEvent(self, event):
         self.zoom = max(6.0, min(17.0, self.zoom + event.angleDelta().y() / 1200.0))
         self.update()
+        self.request_timer.start()
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#AADAFF"))
-
-        if not self.loader:
-            painter.setPen(Qt.black)
-            painter.setFont(QFont("Arial", 14))
-            painter.drawText(self.rect(), Qt.AlignCenter, "Карта не загружена. Откройте или создайте MBTiles.")
-            painter.end()
-            return
-
+    def _calc_viewport(self):
         w, h = self.width(), self.height()
         z_int = max(MIN_DB_ZOOM, min(MAX_DB_ZOOM, int(math.floor(self.zoom))))
         scale = 2 ** (self.zoom - z_int)
@@ -623,28 +643,49 @@ class MapCanvas(QOpenGLWidget):
         min_tx, max_tx = int(math.floor(center_tx - tiles_w / 2)), int(math.ceil(center_tx + tiles_w / 2))
         min_ty, max_ty = int(math.floor(center_ty - tiles_h / 2)), int(math.ceil(center_ty + tiles_h / 2))
 
+        return z_int, center_tx, center_ty, min_tx, max_tx, min_ty, max_ty, scale
+
+    def _queue_visible_tiles(self):
+        # Метод вызывается по таймеру для запроса недостающих тайлов
+        if not self.loader: return
+
+        z_int, center_tx, center_ty, min_tx, max_tx, min_ty, max_ty, _ = self._calc_viewport()
+
         self.loader.visible_tiles = set(
             (z_int, x, y) for x in range(min_tx, max_tx + 1) for y in range(min_ty, max_ty + 1))
 
+        for x in range(min_tx, max_tx + 1):
+            for y in range(min_ty, max_ty + 1):
+                self.loader.request_tile(z_int, x, y, center_tx, center_ty)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        painter.fillRect(self.rect(), QColor("#AADAFF"))
+
+        if not self.loader:
+            painter.setPen(Qt.black)
+            painter.setFont(QFont("Arial", 14))
+            painter.drawText(self.rect(), Qt.AlignCenter, "Карта не загружена. Откройте или создайте MBTiles.")
+            painter.end()
+            return
+
+        z_int, center_tx, center_ty, min_tx, max_tx, min_ty, max_ty, scale = self._calc_viewport()
+
         painter.save()
-        painter.translate(w / 2, h / 2)
+        painter.translate(self.width() / 2, self.height() / 2)
         painter.scale(scale, scale)
 
         for x in range(min_tx, max_tx + 1):
             for y in range(min_ty, max_ty + 1):
                 tile_key = (z_int, x, y)
-                painter.save()
-                painter.translate((x - center_tx) * TILE_SIZE, (y - center_ty) * TILE_SIZE)
-
                 if tile_key in self.tile_cache:
-                    self.draw_vector_features(painter, self.tile_cache[tile_key], z_int, scale)
-                else:
-                    self.loader.request_tile(z_int, x, y, center_tx, center_ty)
-                painter.restore()
-
+                    rect = QRectF((x - center_tx) * TILE_SIZE, (y - center_ty) * TILE_SIZE, TILE_SIZE, TILE_SIZE)
+                    painter.drawPixmap(rect, self.tile_cache[tile_key], QRectF(self.tile_cache[tile_key].rect()))
         painter.restore()
 
-        # Информационный Overlay с Координатами
         painter.setPen(Qt.black)
         painter.setFont(QFont("Consolas", 10))
         y_offset = 20
@@ -655,41 +696,14 @@ class MapCanvas(QOpenGLWidget):
         ]
 
         for text in info:
-            painter.setPen(Qt.white);
+            painter.setPen(Qt.white)
             painter.drawText(11, y_offset + 1, text)
-            painter.setPen(Qt.black);
+            painter.setPen(Qt.black)
             painter.drawText(10, y_offset, text)
             y_offset += 15
         painter.end()
 
-    def draw_vector_features(self, painter, features, zoom, scale_fraction):
-        sorted_features = sorted(features, key=lambda f: LAYER_PRIORITY.get(f.get('layer_name', ''), 0))
 
-        for feat in sorted_features:
-            l_name = feat.get('layer_name', '')
-            if feat['type'] == 'Polygon' and l_name.startswith('building'):
-                rect = feat['path'].boundingRect()
-                if (rect.width() * scale_fraction < 2.5) and (rect.height() * scale_fraction < 2.5): continue
-
-            rule = self.style_manager.get_style(l_name, zoom)
-            if not rule: continue
-
-            pen, brush = QPen(Qt.NoPen), QBrush(Qt.NoBrush)
-            if 'color' in rule:
-                pen = QPen(QColor(rule['color']), rule.get('width', 1.0))
-                pen.setJoinStyle(Qt.RoundJoin);
-                pen.setCapStyle(Qt.RoundCap)
-            if 'fill' in rule and feat['type'] == 'Polygon':
-                brush = QBrush(QColor(rule['fill']))
-
-            painter.setPen(pen);
-            painter.setBrush(brush)
-            painter.drawPath(feat['path'])
-
-
-# ==========================================
-# Главное Окно
-# ==========================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -761,6 +775,8 @@ class MainWindow(QMainWindow):
     def open_style_editor(self):
         editor = StyleEditorDialog(self.map_canvas.style_manager, self)
         if editor.exec_():
+            self.map_canvas.tile_cache.clear()
+            self.map_canvas._queue_visible_tiles()
             self.map_canvas.update()
 
     def load_new_map(self, file_path):
