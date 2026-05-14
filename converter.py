@@ -14,21 +14,21 @@ from shapely.ops import transform
 import osmium
 from tqdm import tqdm
 
+from backup import write_to_mbtiles
+
 MVT_EXTENT = 4096
 
 with open("config.yaml", 'r', encoding='utf-8') as f:
     CONFIG = yaml.safe_load(f)
 
-ZOOMS = CONFIG.get('zooms', [6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
-MAX_DB_ZOOM = max(ZOOMS) if ZOOMS else 15
+ZOOMS = CONFIG.get('zooms', [6, 10, 15])
+MAX_ZOOM = max(ZOOMS) if ZOOMS else 15
 
 TOLERANCES_LINES = CONFIG.get('tolerances', {}).get('lines', {})
-TOLERANCES_POLYS = CONFIG.get('tolerances', {}).get('polygons', {})
+TOLERANCES_POLYGONS = CONFIG.get('tolerances', {}).get('polygons', {})
 
 
 def get_layer_and_zoom(tags):
-    """Определяет слой и минимальный зум на основе тегов OSM."""
-
     if 'highway' in tags:
         hw = tags['highway']
         if hw in ['motorway', 'trunk']: return f"highway_{hw}", 6
@@ -96,27 +96,25 @@ def process_geometry_batch(batch):
 
             bounds = geom.bounds
             is_poly = geom.geom_type in ['Polygon', 'MultiPolygon']
-            effective_min_zoom = min(min_zoom, MAX_DB_ZOOM)
+            effective_min_zoom = min(min_zoom, MAX_ZOOM)
 
             for zoom in ZOOMS:
                 if zoom < effective_min_zoom: continue
 
                 pixel_size_deg = 360.0 / (256.0 * (2 ** zoom))
 
-                # Адаптивное сжатие: здания сжимаем очень слабо (0.2), чтобы не исказить форму
                 tol_multiplier = 1.0
                 if layer_name.startswith('highway'):
                     tol_multiplier = 0.5
                 elif layer_name == 'building':
                     tol_multiplier = 0.2
                 elif layer_name == 'waterway':
-                    tol_multiplier = 1.5
+                    tol_multiplier = 1.2
 
-                base_tol = TOLERANCES_POLYS.get(zoom, 1.0) if is_poly else TOLERANCES_LINES.get(zoom, 1.0)
+                base_tol = TOLERANCES_POLYGONS.get(zoom, 1.0) if is_poly else TOLERANCES_LINES.get(zoom, 1.0)
                 tolerance = pixel_size_deg * base_tol * tol_multiplier
 
-                # Топологию полигонов сохраняем всегда, чтобы леса не исчезали
-                preserve = True if is_poly or zoom >= 12 else False
+                preserve = True if is_poly or zoom >= 11 else False
                 simplified_geom = geom.simplify(tolerance, preserve_topology=preserve)
 
                 if simplified_geom.is_empty: continue
@@ -142,23 +140,13 @@ def process_geometry_batch(batch):
                             'geometry': mapping(g),
                             'properties': tags_dict
                         })
-        except Exception:
+        except BaseException:
             pass
 
     return {k: dict(v) for k, v in results.items()}
 
-def process_mvt_worker(args):
-    tile_key, layers_dict = args
-    z, x, y = tile_key
-    mvt_layers = [{"name": name, "features": feats} for name, feats in layers_dict.items()]
-    try:
-        mvt_data = mapbox_vector_tile.encode(mvt_layers, default_options={"extents": MVT_EXTENT})
-        return z, x, y, mvt_data
-    except Exception:
-        return None
 
-
-class FastOsmHandler(osmium.SimpleHandler):
+class MapHandler(osmium.SimpleHandler):
     def __init__(self):
         super().__init__()
         self.wkbfab = osmium.geom.WKBFactory()
@@ -168,7 +156,7 @@ class FastOsmHandler(osmium.SimpleHandler):
         self.async_results = []
         self.nodes_count = 0
         self.ways_count = 0
-        self.sema = threading.Semaphore(mp.cpu_count() * 2)
+        self.lock = threading.Semaphore(mp.cpu_count() * 2)
 
     def node(self, n):
         self.nodes_count += 1
@@ -177,11 +165,11 @@ class FastOsmHandler(osmium.SimpleHandler):
 
     def _flush(self):
         if self.batch:
-            self.sema.acquire()
+            self.lock.acquire()
 
             def callback(result):
                 self.async_results.append(result)
-                self.sema.release()
+                self.lock.release()
 
             self.pool.apply_async(process_geometry_batch, (self.batch,), callback=callback)
             self.batch = []
@@ -219,7 +207,18 @@ class FastOsmHandler(osmium.SimpleHandler):
         return aggregated_tiles
 
 
-def write_to_mbtiles(db_path, mvt_generator, total_tiles):
+def process_mvt_worker(args):
+    tile_key, layers_dict = args
+    z, x, y = tile_key
+    mvt_layers = [{"name": name, "features": feats} for name, feats in layers_dict.items()]
+    try:
+        mvt_data = mapbox_vector_tile.encode(mvt_layers, default_options={"extents": MVT_EXTENT})
+        return z, x, y, mvt_data
+    except BaseException:
+        return None
+
+
+def write_mbtiles(db_path, mvt_generator, total_tiles):
     if os.path.exists(db_path): os.remove(db_path)
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -246,7 +245,7 @@ def write_to_mbtiles(db_path, mvt_generator, total_tiles):
 
 
 def run(map_path, output_path):
-    handler = FastOsmHandler()
+    handler = MapHandler()
     print("Инициализация библиотеки Osmium (чтение .pbf)...")
     handler.apply_file(map_path, locations=True, idx='flex_mem')
 
@@ -254,7 +253,7 @@ def run(map_path, output_path):
 
     with mp.Pool(max(1, mp.cpu_count() - 1)) as pool:
         mvt_generator = pool.imap_unordered(process_mvt_worker, tiles_dict.items())
-        write_to_mbtiles(output_path, mvt_generator, len(tiles_dict))
+        write_mbtiles(output_path, mvt_generator, len(tiles_dict))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,6 @@ import sqlite3
 import yaml
 import queue
 import threading
-import mercantile
 import mapbox_vector_tile
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QOpenGLWidget, QVBoxLayout,
@@ -93,6 +92,7 @@ class StyleManager:
     def __init__(self, config_path="style.yaml"):
         self.config_path = config_path
         self.rules = {}
+
         self.load_styles()
 
     def load_styles(self):
