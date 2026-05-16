@@ -5,12 +5,17 @@ layers:
     width: 0.0
     z_index: 30
     z_min: 13
-  building:
-    color: '#B4B3B1'
-    fill: '#D9D8D6'
+  building_large:
+    fill: '#a3a3a3'
     visible: true
-    width: 0.5
-    z_index: 50
+    width: 0.0
+    z_index: 10
+    z_min: 13
+  building_small:
+    fill: '#5b5b5b'
+    visible: true
+    width: 0.0
+    z_index: 10
     z_min: 14
   greenery:
     fill: '#C2DCA8'
