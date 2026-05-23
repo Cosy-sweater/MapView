@@ -3,6 +3,5 @@
 mapfiles
 *.sqlite
 *.pbf
-*.mbtiles
 *.mbtiles-shm
 *.mbtiles-wal

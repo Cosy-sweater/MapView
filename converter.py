@@ -11,11 +11,13 @@ import numpy as np
 import traceback
 from collections import defaultdict
 from shapely.wkb import loads as load_wkb
-from shapely.geometry import mapping, box
+from shapely.geometry import mapping, box, MultiPolygon
 from shapely.validation import make_valid
 from shapely.ops import transform
+from shapely.geometry.polygon import orient
 import osmium
 from tqdm import tqdm
+
 
 MVT_EXTENT = 4096
 
@@ -45,15 +47,12 @@ def get_layer_and_zoom(tags, area_sqm=0):
         if 0 < area_sqm < 50: return "building_small", 14
         return "building_large", 13
 
-    if tags.get('natural') in ['wood', 'scrub', 'heath', 'grassland'] or tags.get('landuse') in ['forest', 'grass',
-                                                                                                 'meadow']:
+    if tags.get('natural') in ['wood', 'scrub', 'heath', 'grassland'] or tags.get('landuse') in ['forest', 'grass', 'meadow']:
         return "greenery", 8
     if tags.get('leisure') in ['park', 'garden', 'pitch', 'nature_reserve']: return "greenery", 10
     if 'landuse' in tags:
-        if tags['landuse'] in ['residential', 'commercial', 'industrial', 'farmland',
-                               'cemetery']: return f"landuse_{tags['landuse']}", 10
+        if tags['landuse'] in ['residential', 'commercial', 'industrial', 'farmland', 'cemetery']: return f"landuse_{tags['landuse']}", 10
     if tags.get('amenity') in ['parking', 'university', 'school', 'hospital']: return "amenity_area", 13
-
     return None, 99
 
 
@@ -67,145 +66,85 @@ def wgs84_to_mercator(lon, lat, z=None):
     return x, y
 
 
-def get_mvt_transformer(w, n, tile_size_m):
+def get_mvt_transformer(w, s, tile_size_m):
     def merc_to_mvt(x, y, z=None):
         x = np.asarray(x)
         y = np.asarray(y)
-        mvt_x = np.round((x - w) / tile_size_m * MVT_EXTENT)
-        mvt_y = np.round((n - y) / tile_size_m * MVT_EXTENT)
+        mvt_x = (x - w) / tile_size_m * MVT_EXTENT
+        mvt_y = (y - s) / tile_size_m * MVT_EXTENT
         if z is not None: return mvt_x, mvt_y, np.asarray(z)
         return mvt_x, mvt_y
-
     return merc_to_mvt
 
 
-def process_geometry_batch(batch):
-    stats = {
-        'input_objects': len(batch),
-        'wkb_parse_errors': 0, 'filtered_by_tags': 0,
-        'projection_errors': 0, 'out_of_bounds': 0, 'successful_features': 0
-    }
+def enforce_mvt_topology(geom):
+    def round_coords(x, y, z=None):
+        return np.round(x), np.round(y)
 
+    geom = transform(round_coords, geom)
+
+    if geom.geom_type in ['Polygon', 'MultiPolygon']:
+        geom = geom.buffer(0)
+        if geom.is_empty: return None
+        if geom.geom_type == 'Polygon':
+            return orient(geom, sign=-1.0)
+        elif geom.geom_type == 'MultiPolygon':
+            return MultiPolygon([orient(p, sign=-1.0) for p in geom.geoms])
+    elif geom.geom_type in ['LineString', 'MultiLineString']:
+        if not geom.is_valid: geom = make_valid(geom)
+        return geom if not geom.is_empty else None
+    return None
+
+
+def process_geometry_batch(batch):
+    stats = {'input_objects': len(batch), 'wkb_parse_errors': 0, 'projection_errors': 0, 'out_of_bounds': 0,
+             'successful_features': 0}
     results = defaultdict(lambda: defaultdict(list))
 
     for wkb_data, tags_dict in batch:
         try:
-            try:
-                geom_wgs84 = load_wkb(wkb_data)
-            except Exception:
-                try:
-                    geom_wgs84 = load_wkb(wkb_data, hex=True)
-                except Exception:
-                    stats['wkb_parse_errors'] += 1
-                    continue
-
+            geom_wgs84 = load_wkb(wkb_data)
             if not geom_wgs84.is_valid: geom_wgs84 = make_valid(geom_wgs84)
-            if geom_wgs84.is_empty: continue
-
-            try:
-                geom_merc = transform(wgs84_to_mercator, geom_wgs84)
-                if not geom_merc.is_valid: geom_merc = make_valid(geom_merc)
-            except Exception:
-                stats['projection_errors'] += 1
-                continue
-
-            if geom_merc.is_empty: continue
+            geom_merc = transform(wgs84_to_mercator, geom_wgs84)
 
             is_poly = geom_merc.geom_type in ['Polygon', 'MultiPolygon']
-            area_sqm = geom_merc.area if is_poly else 0
+            layer_name, min_zoom = get_layer_and_zoom(tags_dict, geom_merc.area if is_poly else 0)
+            if not layer_name: continue
 
-            layer_info = get_layer_and_zoom(tags_dict, area_sqm)
-            if not layer_info or not layer_info[0]:
-                stats['filtered_by_tags'] += 1
-                continue
-
-            layer_name, min_zoom = layer_info
-
-            if layer_name == 'building_small' and is_poly:
-                geom_merc = geom_merc.minimum_rotated_rectangle
-            elif layer_name == 'building_large' and is_poly:
-                geom_merc = geom_merc.simplify(0.5, preserve_topology=True)
-
-            if not geom_merc.is_valid: geom_merc = make_valid(geom_merc)
-            if geom_merc.is_empty: continue
-
-            effective_min_zoom = min(min_zoom, MAX_ZOOM)
             intersecting_tiles = mercantile.tiles(geom_wgs84.bounds[0], geom_wgs84.bounds[1], geom_wgs84.bounds[2],
                                                   geom_wgs84.bounds[3], ZOOMS)
-            feature_added = False
 
             for tile in intersecting_tiles:
-                zoom = tile.z
-                if zoom < effective_min_zoom: continue
+                if tile.z < min_zoom: continue
 
-                tile_merc_bounds = mercantile.xy_bounds(tile)
-                w, s, e, n = tile_merc_bounds.left, tile_merc_bounds.bottom, tile_merc_bounds.right, tile_merc_bounds.top
+                w, s, e, n = mercantile.xy_bounds(tile)
                 tile_size_m = e - w
+                tile_bbox_merc = box(w, s, e, n)
 
-                buffer_m = tile_size_m / 16.0
-                tile_bbox_merc = box(w - buffer_m, s - buffer_m, e + buffer_m, n + buffer_m)
-
-                try:
-                    clipped_merc = geom_merc.intersection(tile_bbox_merc)
-                except Exception:
-                    try:
-                        clipped_merc = geom_merc.buffer(0).intersection(tile_bbox_merc)
-                    except Exception:
-                        continue
-
+                clipped_merc = geom_merc.intersection(tile_bbox_merc)
                 if clipped_merc.is_empty: continue
 
-                mvt_unit_m = tile_size_m / float(MVT_EXTENT)
-
                 if not layer_name.startswith('building'):
-                    tol_multiplier = 0.5 if layer_name.startswith(
-                        'highway') else 1.2 if layer_name == 'waterway' else 1.0
-                    base_tol = TOLERANCES_POLYGONS.get(zoom, 1.0) if is_poly else TOLERANCES_LINES.get(zoom, 1.0)
-                    tolerance_m = base_tol * mvt_unit_m * tol_multiplier
-                    preserve = True if zoom >= 12 else False
-
-                    simplified_merc = clipped_merc.simplify(tolerance_m, preserve_topology=preserve)
+                    tol = (TOLERANCES_POLYGONS.get(tile.z, 1.0) if is_poly else TOLERANCES_LINES.get(tile.z, 1.0)) * (
+                                tile_size_m / MVT_EXTENT)
+                    simplified = clipped_merc.simplify(tol, preserve_topology=True)
                 else:
-                    simplified_merc = clipped_merc
+                    simplified = clipped_merc
 
-                if simplified_merc.is_empty: continue
-                if not simplified_merc.is_valid: simplified_merc = make_valid(simplified_merc)
-                if simplified_merc.is_empty: continue
+                mvt_geom = transform(get_mvt_transformer(w, s, tile_size_m), simplified)
 
-                transformer = get_mvt_transformer(w, n, tile_size_m)
-                try:
-                    mvt_geom = transform(transformer, simplified_merc)
-                    if not mvt_geom.is_valid: mvt_geom = make_valid(mvt_geom)
-                except Exception:
-                    continue
-
-                valid_geoms = []
-                if mvt_geom.geom_type == 'GeometryCollection':
-                    valid_geoms = [g for g in mvt_geom.geoms if
-                                   g.geom_type in ['LineString', 'MultiLineString', 'Polygon', 'MultiPolygon']]
-                elif mvt_geom.geom_type in ['LineString', 'MultiLineString', 'Polygon', 'MultiPolygon']:
-                    valid_geoms = [mvt_geom]
-
-                for g in valid_geoms:
-                    results[(zoom, tile.x, tile.y)][layer_name].append({
-                        'geometry': mapping(g),
-                        'properties': tags_dict
-                    })
-                    feature_added = True
-
-            if not feature_added:
-                stats['out_of_bounds'] += 1
-            else:
-                stats['successful_features'] += 1
-
-        except Exception as e:
-            if "side location conflict" not in str(e): pass
-
-    safe_results = {}
-    for tile_key, layers in results.items():
-        safe_results[tile_key] = dict(layers)
-
-    return safe_results, stats
+                valid_g = enforce_mvt_topology(mvt_geom)
+                if valid_g:
+                    subs = valid_g.geoms if valid_g.geom_type in ['GeometryCollection', 'MultiPolygon',
+                                                                  'MultiLineString'] else [valid_g]
+                    for g in subs:
+                        if not g.is_empty:
+                            results[(tile.z, tile.x, tile.y)][layer_name].append(
+                                {'geometry': mapping(g), 'properties': tags_dict})
+                            feature_added = True
+        except Exception:
+            continue
+    return dict(results), stats
 
 
 def error_callback(err):
@@ -301,6 +240,7 @@ def process_mvt_worker(args):
         mvt_data = mapbox_vector_tile.encode(mvt_layers, default_options={"extents": MVT_EXTENT})
         return z, x, y, mvt_data
     except Exception as e:
+        print(f"\n[MVT ENCODE ERROR] Тайл {z}/{x}/{y}: {e}")
         return None
 
 
@@ -349,5 +289,5 @@ def run(map_path, output_path):
 
 if __name__ == "__main__":
     # TODO Исправить ошибку перезаписи открытого файла
-    #run("mapfiles/cyprus.osm.pbf", "cyprus_fast.mbtiles")
+    # run("mapfiles/cyprus.osm.pbf", "cyprus_fast.mbtiles")
     print("Hello world!")
