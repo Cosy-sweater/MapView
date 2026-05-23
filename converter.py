@@ -274,7 +274,7 @@ def write_mbtiles(db_path, mvt_generator, total_tiles):
 def run(map_path, output_path):
     handler = MapHandler()
     print("Чтение файла pbf")
-    handler.apply_file(map_path, locations=True, idx='flex_mem')
+    handler.apply_file(map_path, locations=True, idx='dense_file_array') # dense_file_array | flex_mem
 
     tiles_dict = handler.finish()
 
@@ -289,5 +289,6 @@ def run(map_path, output_path):
 
 if __name__ == "__main__":
     # TODO Исправить ошибку перезаписи открытого файла
+    # TODO добавить возможность переключать flex_mem
     # run("mapfiles/cyprus.osm.pbf", "cyprus_fast.mbtiles")
     print("Hello world!")
