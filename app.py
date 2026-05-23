@@ -544,23 +544,23 @@ class TileLoader:
 
                 path = QPainterPath()
                 if geom_type == 'LineString':
-                    path.moveTo(coords[0][0] * MVT_SCALE, coords[0][1] * MVT_SCALE)
+                    path.moveTo(coords[0][0] * MVT_SCALE, (MVT_EXTENT - coords[0][1]) * MVT_SCALE)
                     for pt in coords[1:]:
-                        path.lineTo(pt[0] * MVT_SCALE, pt[1] * MVT_SCALE)
+                        path.lineTo(pt[0] * MVT_SCALE, (MVT_EXTENT - pt[1]) * MVT_SCALE)
                 elif geom_type == 'Polygon':
                     path.setFillRule(Qt.OddEvenFill)
                     for ring in coords:
-                        path.moveTo(ring[0][0] * MVT_SCALE, ring[0][1] * MVT_SCALE)
+                        path.moveTo(ring[0][0] * MVT_SCALE, (MVT_EXTENT - ring[0][1]) * MVT_SCALE)
                         for pt in ring[1:]:
-                            path.lineTo(pt[0] * MVT_SCALE, pt[1] * MVT_SCALE)
+                            path.lineTo(pt[0] * MVT_SCALE, (MVT_EXTENT - pt[1]) * MVT_SCALE)
                         path.closeSubpath()
                 elif geom_type == 'MultiPolygon':
                     path.setFillRule(Qt.OddEvenFill)
                     for poly in coords:
                         for ring in poly:
-                            path.moveTo(ring[0][0] * MVT_SCALE, ring[0][1] * MVT_SCALE)
+                            path.moveTo(ring[0][0] * MVT_SCALE, (MVT_EXTENT - ring[0][1]) * MVT_SCALE)
                             for pt in ring[1:]:
-                                path.lineTo(pt[0] * MVT_SCALE, pt[1] * MVT_SCALE)
+                                path.lineTo(pt[0] * MVT_SCALE, (MVT_EXTENT - pt[1]) * MVT_SCALE)
                             path.closeSubpath()
 
                 features_data.append({
@@ -795,12 +795,12 @@ class MapCanvas(QOpenGLWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
-        painter.fillRect(self.rect(), QColor("#AADAFF"))
+        painter.fillRect(self.rect(), QColor("#b6eda8"))
 
         if not self.loader:
             painter.setPen(Qt.black)
             painter.setFont(QFont("Arial", 14))
-            painter.drawText(self.rect(), Qt.AlignCenter, "Карта не загружена. Откройте или создайте MBTiles.")
+            painter.drawText(self.rect(), Qt.AlignCenter, "Карта не загружена. Откройте или создайте новую.")
             painter.end()
             return
 
